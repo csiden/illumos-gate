@@ -358,6 +358,27 @@ nfs_smf_get_prop(char *prop_name, char *propbuf, char *instance,
 	    instance, sctype, svc_name, bufsz));
 }
 
+/* Get an integer (base 10) property */
+int
+nfs_smf_get_iprop(char *prop_name, int *rvp, char *instance,
+    scf_type_t sctype, char *svc_name)
+{
+	char propbuf[32];
+	int bufsz, rc, val;
+
+	bufsz = sizeof (propbuf);
+	rc = fs_smf_get_prop(NFS_SMF, prop_name, propbuf,
+	    instance, sctype, svc_name, &bufsz);
+	if (rc != SA_OK)
+		return (rc);
+	errno = 0;
+	val = strtol(propbuf, (char **)NULL, 10);
+	if (errno != 0)
+		return (SA_BAD_VALUE);
+	*rvp = val;
+	return (SA_OK);
+}
+
 int
 nfs_smf_set_prop(char *prop_name, char *value, char *instance,
     scf_type_t type, char *svc_name)
