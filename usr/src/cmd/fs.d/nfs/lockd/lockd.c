@@ -19,6 +19,9 @@
  * CDDL HEADER END
  */
 /*
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ */
+/*
  * Copyright (c) 1989, 2010, Oracle and/or its affiliates. All rights reserved.
  */
 
@@ -88,7 +91,7 @@ struct lm_svc_args lmargs = {
 	.debug = 0,
 	.timout = 5 * 60,
 	.grace = 60,
-	.retransmittimeout = 5
+	.retransmittimeout = 15
 };
 int max_servers = 20;
 
@@ -102,6 +105,8 @@ static int nlmsvcpool(int max_servers);
 static	void	usage(void);
 
 extern	int	_nfssys(int, void *);
+static void sigterm_handler(void);
+static void shutdown_lockd(void);
 
 extern int	daemonize_init(void);
 extern void	daemonize_fini(int fd);
@@ -115,10 +120,10 @@ static	char	*MyName;
  */
 static  NETSELDECL(defaultproviders)[] = {
 	"/dev/ticotsord",
-	"/dev/tcp6",
 	"/dev/tcp",
-	"/dev/udp6",
 	"/dev/udp",
+	"/dev/tcp6",
+	"/dev/udp6",
 	NULL
 };
 
@@ -143,6 +148,7 @@ main(int ac, char *av[])
 	sigset_t sgset;
 	int c, pid, ret, val;
 	int pipe_fd = -1;
+	struct sigaction act;
 
 	MyName = *av;
 
@@ -376,6 +382,15 @@ main(int ac, char *av[])
 	}
 
 	/*
+	 * Install atexit and sigterm handlers
+	 */
+	act.sa_handler = sigterm_handler;
+	act.sa_flags = 0;
+
+	(void) sigaction(SIGTERM, &act, NULL);
+	(void) atexit(shutdown_lockd);
+
+	/*
 	 * Now open up for signal delivery
 	 */
 	(void) thr_sigsetmask(SIG_UNBLOCK, &sgset, NULL);
@@ -480,6 +495,20 @@ ncdev_to_rdev(const char *ncdev)
 	return (st.st_rdev);
 }
 
+static void
+sigterm_handler(void)
+{
+	/* to call atexit handler */
+	exit(0);
+}
+
+static void
+shutdown_lockd(void)
+{
+	(void )_nfssys(KILL_LOCKMGR, NULL);
+}
+
+
 /*
  * Establish NLM service thread.
  */
@@ -501,6 +530,12 @@ nlmsvc(int fd, struct netbuf addrmask, struct netconfig *nconf)
 	lma.n_fmly = ncfmly_to_lmfmly(nconf->nc_protofmly);
 	lma.n_proto = nctype_to_lmprot(nconf->nc_semantics);
 	lma.n_rdev = ncdev_to_rdev(nconf->nc_device);
+
+	/*
+	 * FIXME[DK]: make debug=3 by default to simplify development.
+	 * Later the following line must be removed.
+	 */
+	lma.debug = 3;
 
 	return (_nfssys(LM_SVC, &lma));
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2010 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright 2012 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2008 Isilon Inc http://www.isilon.com/
  * Authors: Doug Rabson <dfr@rabson.org>
  * Developed with Red Inc: Alfred Perlstein <alfred@freebsd.org>
@@ -27,7 +27,7 @@
  */
 
 /*
- * NFS Lock Manager, start/stop, support functions, etc.
+ * NFS LockManager, start/stop, support functions, etc.
  * Most of the interesting code is here.
  *
  * Source code derived from FreeBSD nlm_prot_impl.c
@@ -46,20 +46,21 @@
 #include <sys/syscall.h>
 #include <sys/syslog.h>
 #include <sys/systm.h>
-#include <sys/taskq.h>
+#include <sys/class.h>
 #include <sys/unistd.h>
 #include <sys/vnode.h>
 #include <sys/vfs.h>
 #include <sys/queue.h>
+#include <sys/bitmap.h>
+#include <sys/sdt.h>
+#include <netinet/in.h>
 
 #include <rpc/rpc.h>
 #include <rpc/xdr.h>
 #include <rpc/pmap_prot.h>
 #include <rpc/pmap_clnt.h>
-/* #include <rpc/rpcb_clnt.h> ? */
 #include <rpc/rpcb_prot.h>
 
-/* #include <rpcsvc/nfs_proto.h> */
 #include <rpcsvc/nlm_prot.h>
 #include <rpcsvc/sm_inter.h>
 
@@ -67,183 +68,416 @@
 #include <nfs/nfs_clnt.h>
 #include <nfs/export.h>
 #include <nfs/rnode.h>
+#include <nfs/lm.h>
 
 #include "nlm_impl.h"
 
-/*
- * If a host is inactive (and holds no locks) for this amount of
- * seconds, we consider it idle and stop tracking it.
- */
-#define	NLM_IDLE_TIMEOUT	30
+struct nlm_knc {
+	struct knetconfig	n_knc;
+	const char		*n_netid;
+};
 
 /*
- * We check the host list for idle every few seconds.
+ * Number of attempts NLM tries to obtain RPC binding
+ * of local statd.
  */
-#define	NLM_IDLE_PERIOD		5
+#define	NLM_NSM_RPCBIND_RETRIES 10
 
 /*
- * Grace period handling. The value of nlm_grace_threshold is the
- * value of ddi_get_lbolt() after which we are serving requests normally.
+ * Timeout (in seconds) NLM waits before making another
+ * attempt to obtain RPC binding of local statd.
  */
-clock_t nlm_grace_threshold;
+#define	NLM_NSM_RPCBIND_TIMEOUT 5
 
 /*
- * We check for idle hosts if ddi_get_lbolt() is greater than
- * nlm_next_idle_check,
+ * Total number of sysids in NLM sysid bitmap
  */
-static clock_t nlm_next_idle_check;
+#define	NLM_BMAP_NITEMS	(LM_SYSID_MAX + 1)
 
 /*
- * An RPC client handle that can be used to communicate with the local
- * NSM.
+ * Number of ulong_t words in bitmap that is used
+ * for allocation of sysid numbers.
  */
-static CLIENT *nlm_nsm;
+#define	NLM_BMAP_WORDS  (NLM_BMAP_NITEMS / BT_NBIPUL)
 
 /*
- * An AUTH handle for the server's creds.
+ * Given an interger x, the macro is returned
+ * -1 if x is negative,
+ *  0 if x is zero
+ *  1 if x is positive
  */
-static AUTH *nlm_auth;
+#define	SIGN(x) (((x) < 0) - ((x) > 0))
+
+#define	ARRSIZE(arr)	(sizeof (arr) / sizeof ((arr)[0]))
+#define	NLM_KNCS	ARRSIZE(nlm_netconfigs)
+
+krwlock_t lm_lck;
 
 /*
- * A zero timeval for sending async RPC messages.
+ * Zero timeout for asynchronous NLM RPC operations
  */
-struct timeval nlm_zero_tv = { 0, 0 };
+static const struct timeval nlm_rpctv_zero = { 0,  0 };
 
 /*
- * The local NSM state number
+ * List of all Zone globals nlm_globals instences
+ * linked together.
  */
-int nlm_nsm_state;
-
+static struct nlm_globals_list nlm_zones_list; /* (g) */
 
 /*
- * A lock to protect the host list and waiting lock list.
+ * NLM kmem caches
  */
-static kmutex_t nlm_global_lock;
-
-static struct nlm_host_list nlm_hosts;	/* (g) */
-static int32_t nlm_next_sysid = 1;	/* (g) */
-
-static recovery_cb nlm_recovery_func = NULL;	/* (c) */
-
-void nlm_cancel_wait_locks(struct nlm_host *);
-
-/* ******************************************************************* */
+static struct kmem_cache *nlm_hosts_cache = NULL;
+static struct kmem_cache *nlm_vhold_cache = NULL;
 
 /*
- * Initialise NLM globals.
+ * A bitmap for allocation of new sysids.
+ * Sysid is a unique number between LM_SYSID
+ * and LM_SYSID_MAX. Sysid represents unique remote
+ * host that does file locks on the given host.
  */
-#if 0	/* XXX */
-static void
-nlm_init(void *dummy)
+static ulong_t	nlm_sysid_bmap[NLM_BMAP_WORDS];	/* (g) */
+static int	nlm_sysid_nidx;			/* (g) */
+
+/*
+ * RPC service registration for all transports
+ */
+static SVC_CALLOUT nlm_svcs[] = {
+	{ NLM_PROG, 4, 4, nlm_prog_4 },	/* NLM4_VERS */
+	{ NLM_PROG, 1, 3, nlm_prog_3 }	/* NLM_VERS - NLM_VERSX */
+};
+
+static SVC_CALLOUT_TABLE nlm_sct = {
+	ARRSIZE(nlm_svcs),
+	FALSE,
+	nlm_svcs
+};
+
+/*
+ * Static table of all netid/knetconfig network
+ * lock manager can work with. nlm_netconfigs table
+ * is used when we need to get valid knetconfig by
+ * netid and vice versa.
+ *
+ * Knetconfigs are activated either by the call from
+ * user-space lockd daemon (server side) or by taking
+ * knetconfig from NFS mountinfo (client side)
+ */
+static struct nlm_knc nlm_netconfigs[] = { /* (g) */
+	/* UDP */
+	{
+		{ NC_TPI_CLTS, NC_INET, NC_UDP, NODEV },
+		"udp",
+	},
+	/* TCP */
+	{
+		{ NC_TPI_COTS_ORD, NC_INET, NC_TCP, NODEV },
+		"tcp",
+	},
+	/* UDP over IPv6 */
+	{
+		{ NC_TPI_CLTS, NC_INET6, NC_UDP, NODEV },
+		"udp6",
+	},
+	/* TCP over IPv6 */
+	{
+		{ NC_TPI_COTS_ORD, NC_INET6, NC_TCP, NODEV },
+		"tcp6",
+	},
+	/* ticlts (loopback over UDP) */
+	{
+		{ NC_TPI_CLTS, NC_LOOPBACK, NC_NOPROTO, NODEV },
+		"ticlts",
+	},
+	/* ticotsord (loopback over TCP) */
+	{
+		{ NC_TPI_COTS_ORD, NC_LOOPBACK, NC_NOPROTO, NODEV },
+		"ticotsord",
+	},
+};
+
+/*
+ * NLM misc. function
+ */
+static void nlm_copy_netbuf(struct netbuf *, struct netbuf *);
+static int nlm_netbuf_addrs_cmp(struct netbuf *, struct netbuf *);
+static void nlm_kmem_reclaim(void *);
+static void nlm_pool_shutdown(void);
+static void nlm_suspend_zone(struct nlm_globals *);
+static void nlm_resume_zone(struct nlm_globals *);
+
+/*
+ * NLM thread functions
+ */
+static void nlm_gc(struct nlm_globals *);
+static void nlm_reclaimer(struct nlm_host *);
+
+/*
+ * NLM NSM functions
+ */
+static int nlm_init_local_knc(struct knetconfig *);
+static int nlm_nsm_init_local(struct nlm_nsm *);
+static int nlm_nsm_init(struct nlm_nsm *, struct knetconfig *, struct netbuf *);
+static void nlm_nsm_fini(struct nlm_nsm *);
+static enum clnt_stat nlm_nsm_simu_crash(struct nlm_nsm *);
+static enum clnt_stat nlm_nsm_stat(struct nlm_nsm *, int32_t *);
+static enum clnt_stat nlm_nsm_mon(struct nlm_nsm *, char *, uint16_t);
+static enum clnt_stat nlm_nsm_unmon(struct nlm_nsm *, char *);
+
+/*
+ * NLM host functions
+ */
+static int nlm_host_ctor(void *, void *, int);
+static void nlm_host_dtor(void *, void *);
+static void nlm_host_destroy(struct nlm_host *);
+static struct nlm_host *nlm_host_create(char *, const char *,
+    struct knetconfig *, struct netbuf *);
+static struct nlm_host *nlm_host_find_locked(struct nlm_globals *,
+    const char *, struct netbuf *, avl_index_t *);
+static void nlm_host_unregister(struct nlm_globals *, struct nlm_host *);
+static void nlm_host_gc_vholds(struct nlm_host *);
+static bool_t nlm_host_has_srv_locks(struct nlm_host *);
+static bool_t nlm_host_has_cli_locks(struct nlm_host *);
+static bool_t nlm_host_has_locks(struct nlm_host *);
+
+/*
+ * NLM vhold functions
+ */
+static int nlm_vhold_ctor(void *, void *, int);
+static void nlm_vhold_dtor(void *, void *);
+static void nlm_vhold_destroy(struct nlm_host *,
+    struct nlm_vhold *);
+static bool_t nlm_vhold_busy(struct nlm_host *, struct nlm_vhold *);
+static void nlm_vhold_clean(struct nlm_vhold *, int);
+
+/*
+ * NLM client/server sleeping locks/share reservation functions
+ */
+struct nlm_slreq *nlm_slreq_find_locked(struct nlm_host *,
+    struct nlm_vhold *, struct flock64 *);
+static struct nlm_shres *nlm_shres_create_item(struct shrlock *, vnode_t *);
+static void nlm_shres_destroy_item(struct nlm_shres *);
+static bool_t nlm_shres_equal(struct shrlock *, struct shrlock *);
+
+/*
+ * NLM initialization functions.
+ */
+void
+nlm_init(void)
 {
-	int error;
+	nlm_hosts_cache = kmem_cache_create("nlm_host_cache",
+	    sizeof (struct nlm_host), 0, nlm_host_ctor, nlm_host_dtor,
+	    nlm_kmem_reclaim, NULL, NULL, 0);
 
-	mutex_init(&nlm_global_lock, "nlm_global_lock", MUTEX_DEFAULT, NULL);
-	TAILQ_INIT(&nlm_hosts);
+	nlm_vhold_cache = kmem_cache_create("nlm_vhold_cache",
+	    sizeof (struct nlm_vhold), 0, nlm_vhold_ctor, nlm_vhold_dtor,
+	    NULL, NULL, NULL, 0);
 
-	error = syscall_register(&nlm_syscall_offset, &nlm_syscall_sysent,
-	    &nlm_syscall_prev_sysent);
-	if (error)
-		NLM_ERR("Can't register NLM syscall\n");
-	else
-		nlm_syscall_registered = TRUE;
-}
-#endif	/* XXX */
+	nlm_rpc_init();
+	TAILQ_INIT(&nlm_zones_list);
 
-#if 0	/* XXX */
-static void
-nlm_uninit(void *dummy)
-{
+	/* initialize sysids bitmap */
+	bzero(nlm_sysid_bmap, sizeof (nlm_sysid_bmap));
+	nlm_sysid_nidx = 1;
 
-	if (nlm_syscall_registered)
-		syscall_deregister(&nlm_syscall_offset,
-		    &nlm_syscall_prev_sysent);
-}
-#endif	/* XXX */
-
-/*
- * The in-kernel RPC (kRPC) subsystem uses TLI/XTI, which needs
- * both a knetconfig and an address when creating endpoints.
- * These functions keep track of the bindings give to us by
- * the user-level lockd, allowing fetch by "netid".
- */
-
-static void
-nlm_nc_clear(struct nlm_globals *g)
-{
-	/* XXX todo */
-}
-
-static void
-nlm_nc_add(struct nlm_globals *g, const char *netid, struct knetconfig *knc)
-{
-	/* XXX todo */
-}
-
-/*
- * Lookup (and hold) a knetconfig from one of our
- * service bindings.
- */
-static struct knetconfig *
-nlm_knetconfig_from_netid(const char *netid)
-{
-	/* XXX todo */
-	return (NULL);
+	/*
+	 * Reserv the sysid #0, because it's associated
+	 * with local locks only. Don't let to allocate
+	 * it for remote locks.
+	 */
+	BT_SET(nlm_sysid_bmap, 0);
 }
 
 void
-nlm_knetconfig_rele(struct knetconfig *knc)
+nlm_globals_register(struct nlm_globals *g)
 {
-	/* XXX todo */
+	rw_enter(&lm_lck, RW_WRITER);
+	TAILQ_INSERT_TAIL(&nlm_zones_list, g, nlm_link);
+	rw_exit(&lm_lck);
 }
 
+void
+nlm_globals_unregister(struct nlm_globals *g)
+{
+	rw_enter(&lm_lck, RW_WRITER);
+	TAILQ_REMOVE(&nlm_zones_list, g, nlm_link);
+	rw_exit(&lm_lck);
+}
+
+/* ARGSUSED */
+static void
+nlm_kmem_reclaim(void *cdrarg)
+{
+	struct nlm_globals *g;
+
+	rw_enter(&lm_lck, RW_READER);
+	TAILQ_FOREACH(g, &nlm_zones_list, nlm_link)
+		cv_broadcast(&g->nlm_gc_sched_cv);
+
+	rw_exit(&lm_lck);
+}
 
 /*
- * Figure out what "netid" we want, given a knetconfig.
- * This "knows" a bit about what bindings lockd will
- * normally register, but oh well.  This is called with
- * NFS knetconfigs, which may have types we don't know.
+ * NLM garbage collector thread (GC).
+ *
+ * NLM GC periodically checks whether there're any host objects
+ * that can be cleaned up. It also releases stale vnodes that
+ * live on the server side (under protection of vhold objects).
+ *
+ * NLM host objects are cleaned up from GC thread because
+ * operations helping us to determine whether given host has
+ * any locks can be quite expensive and it's not good to call
+ * them every time the very last reference to the host is dropped.
+ * Thus we use "lazy" approach for hosts cleanup.
+ *
+ * The work of GC is to release stale vnodes on the server side
+ * and destroy hosts that haven't any locks and any activity for
+ * some time (i.e. idle hosts).
  */
-const char *
-nlm_netid_from_knetconfig(struct knetconfig *knc)
+static void
+nlm_gc(struct nlm_globals *g)
 {
-	bool_t co;
+	struct nlm_host *hostp;
+	clock_t now, idle_period;
 
-	switch (knc->knc_semantics) {
-	case NC_TPI_CLTS:
-		co = FALSE;
-		break;
-	case NC_TPI_COTS_ORD:
-		co = TRUE;
-		break;
-	default:
-		return (NULL);
+	idle_period = SEC_TO_TICK(g->cn_idle_tmo);
+	mutex_enter(&g->lock);
+	for (;;) {
+		/*
+		 * GC thread can be explicitly scheduled from
+		 * memory reclamation function.
+		 */
+		(void) cv_timedwait(&g->nlm_gc_sched_cv, &g->lock,
+		    ddi_get_lbolt() + idle_period);
+
+		/*
+		 * NLM is shutting down, time to die.
+		 */
+		if (g->run_status == NLM_ST_STOPPING)
+			break;
+
+		now = ddi_get_lbolt();
+		DTRACE_PROBE2(gc__start, struct nlm_globals *, g,
+		    clock_t, now);
+
+		/*
+		 * Handle all hosts that are unused at the moment
+		 * until we meet one with idle timeout in future.
+		 */
+		while ((hostp = TAILQ_FIRST(&g->nlm_idle_hosts)) != NULL) {
+			bool_t has_locks = FALSE;
+
+			if (hostp->nh_idle_timeout > now)
+				break;
+
+			/*
+			 * Drop global lock while doing expensive work
+			 * on this host. We'll re-check any conditions
+			 * that might change after retaking the global
+			 * lock.
+			 */
+			mutex_exit(&g->lock);
+			mutex_enter(&hostp->nh_lock);
+
+			/*
+			 * nlm_globals lock was dropped earlier because
+			 * garbage collecting of vholds and checking whether
+			 * host has any locks/shares are expensive operations.
+			 */
+			nlm_host_gc_vholds(hostp);
+			has_locks = nlm_host_has_locks(hostp);
+
+			mutex_exit(&hostp->nh_lock);
+			mutex_enter(&g->lock);
+
+			/*
+			 * While we were doing expensive operations outside of
+			 * nlm_globals critical section, somebody could
+			 * take the host, add lock/share to one of its vnodes
+			 * and release the host back. If so, host's idle timeout
+			 * is renewed and our information about locks on the
+			 * given host is outdated.
+			 */
+			if (hostp->nh_idle_timeout > now)
+				continue;
+
+			/*
+			 * If either host has locks or somebody has began to
+			 * use it while we were outside the nlm_globals critical
+			 * section. In both cases we have to renew host's
+			 * timeout and put it to the end of LRU list.
+			 */
+			if (has_locks || hostp->nh_refs > 0) {
+				TAILQ_REMOVE(&g->nlm_idle_hosts,
+				    hostp, nh_link);
+				hostp->nh_idle_timeout = now + idle_period;
+				TAILQ_INSERT_TAIL(&g->nlm_idle_hosts,
+				    hostp, nh_link);
+				continue;
+			}
+
+			/*
+			 * We're here if all the following conditions hold:
+			 * 1) Host hasn't any locks or share reservations
+			 * 2) Host is unused
+			 * 3) Host wasn't touched by anyone at least for
+			 *    g->cn_idle_tmo seconds.
+			 *
+			 * So, now we can destroy it.
+			 */
+			nlm_host_unregister(g, hostp);
+			mutex_exit(&g->lock);
+
+			nlm_host_unmonitor(g, hostp);
+			nlm_host_destroy(hostp);
+			mutex_enter(&g->lock);
+			if (g->run_status == NLM_ST_STOPPING)
+				break;
+
+		}
+
+		DTRACE_PROBE(gc__end);
 	}
 
-	if (0 == strcmp(knc->knc_protofmly, NC_INET))
-		return ((co) ? "tcp" : "udp");
-	if (0 == strcmp(knc->knc_protofmly, NC_INET6))
-		return ((co) ? "tcp6" : "udp6");
-	if (0 == strcmp(knc->knc_protofmly, NC_LOOPBACK))
-		return ((co) ? "ticotsord" : "ticlts");
+	DTRACE_PROBE1(gc__exit, struct nlm_globals *, g);
 
-	return (NULL);
+	/* Let others know that GC has died */
+	g->nlm_gc_thread = NULL;
+	mutex_exit(&g->lock);
+
+	cv_broadcast(&g->nlm_gc_finish_cv);
+	zthread_exit();
 }
 
-
 /*
- * Copy a struct netbuf.  (see tiuser.h)
+ * Thread reclaim locks/shares acquired by the client side
+ * on the given server represented by hostp.
  */
-void
-nlm_copy_netbuf(struct netbuf *dst, struct netbuf *src)
+static void
+nlm_reclaimer(struct nlm_host *hostp)
 {
+	struct nlm_globals *g;
 
-	ASSERT(src->len <= src->maxlen);
+	mutex_enter(&hostp->nh_lock);
+	hostp->nh_reclaimer = curthread;
+	mutex_exit(&hostp->nh_lock);
 
-	dst->maxlen = src->maxlen;
-	dst->len = src->len;
-	dst->buf = kmem_zalloc(src->maxlen, KM_SLEEP);
-	bcopy(src->buf, dst->buf, src->len);
+	g = zone_getspecific(nlm_zone_key, curzone);
+	nlm_reclaim_client(g, hostp);
+
+	mutex_enter(&hostp->nh_lock);
+	hostp->nh_flags &= ~NLM_NH_RECLAIM;
+	hostp->nh_reclaimer = NULL;
+	cv_broadcast(&hostp->nh_recl_cv);
+	mutex_exit(&hostp->nh_lock);
+
+	/*
+	 * Host was explicitly referenced before
+	 * nlm_reclaim() was called, release it
+	 * here.
+	 */
+	nlm_host_release(g, hostp);
+	zthread_exit();
 }
 
 /*
@@ -252,375 +486,720 @@ nlm_copy_netbuf(struct netbuf *dst, struct netbuf *src)
 void
 nlm_copy_netobj(struct netobj *dst, struct netobj *src)
 {
-
 	dst->n_len = src->n_len;
 	dst->n_bytes = kmem_alloc(src->n_len, KM_SLEEP);
 	bcopy(src->n_bytes, dst->n_bytes, src->n_len);
 }
 
 /*
- * Create an RPC client handle for the given (prog, vers)
- * Note: modifies *addr (inserts the port number)
- *
- * The in-kernel RPC (kRPC) subsystem uses TLI/XTI, and
- * therfore needs _both_ a knetconfig and an address when
- * establishing a network endpoint.  We keep a collection
- * of the knetconfig structs for all our RPC bindings and
- * find one when needed using the "netid".
+ * An NLM specificw replacement for clnt_call().
+ * nlm_clnt_call() is used by all RPC functions generated
+ * from nlm_prot.x specification. The function is aware
+ * about some pitfalls of NLM RPC procedures and has a logic
+ * that handles them properly.
  */
-static CLIENT *
-nlm_get_rpc(const char *netid, struct netbuf *addr,
-	rpcprog_t prog, rpcvers_t vers)
+enum clnt_stat
+nlm_clnt_call(CLIENT *clnt, rpcproc_t procnum, xdrproc_t xdr_args,
+    caddr_t argsp, xdrproc_t xdr_result, caddr_t resultp, struct timeval wait)
 {
-	struct knetconfig *knc = NULL;
+	k_sigset_t oldmask;
+	enum clnt_stat stat;
+	bool_t sig_blocked = FALSE;
+
+	/*
+	 * If NLM RPC procnum is one of the NLM _RES procedures
+	 * that are used to reply to asynchronous NLM RPC
+	 * (MSG calls), explicitly set RPC timeout to zero.
+	 * Client doesn't send a reply to RES procedures, so
+	 * we don't need to wait anything.
+	 *
+	 * NOTE: we ignore NLM4_*_RES procnums because they are
+	 * equal to NLM_*_RES numbers.
+	 */
+	if (procnum >= NLM_TEST_RES && procnum <= NLM_GRANTED_RES)
+		wait = nlm_rpctv_zero;
+
+	/*
+	 * We need to block signals in case of NLM_CANCEL RPC
+	 * in order to prevent interruption of network RPC
+	 * calls.
+	 */
+	if (procnum == NLM_CANCEL) {
+		k_sigset_t newmask;
+
+		sigfillset(&newmask);
+		sigreplace(&newmask, &oldmask);
+		sig_blocked = TRUE;
+	}
+
+	stat = clnt_call(clnt, procnum, xdr_args,
+	    argsp, xdr_result, resultp, wait);
+
+	/*
+	 * Restore signal mask back if signals were blocked
+	 */
+	if (sig_blocked)
+		sigreplace(&oldmask, (k_sigset_t *)NULL);
+
+	return (stat);
+}
+
+/*
+ * Suspend NLM client/server in the given zone.
+ *
+ * During suspend operation we mark those hosts
+ * that have any locks with NLM_NH_SUSPEND flags,
+ * so that they can be checked later, when resume
+ * operation occurs.
+ */
+static void
+nlm_suspend_zone(struct nlm_globals *g)
+{
+	struct nlm_host *hostp;
+	struct nlm_host_list all_hosts;
+
+	/*
+	 * Note that while we're doing suspend, GC thread is active
+	 * and it can destroy some hosts while we're walking through
+	 * the hosts tree. To prevent that and make suspend logic
+	 * a bit more simple we put all hosts to local "all_hosts"
+	 * list and increment reference counter of each host.
+	 * This guaranties that no hosts will be released while
+	 * we're doing suspend.
+	 * NOTE: reference of each host must be dropped during
+	 * resume operation.
+	 */
+	TAILQ_INIT(&all_hosts);
+	mutex_enter(&g->lock);
+	for (hostp = avl_first(&g->nlm_hosts_tree); hostp != NULL;
+	    hostp = AVL_NEXT(&g->nlm_hosts_tree, hostp)) {
+		/*
+		 * If host is idle, remove it from idle list and
+		 * clear idle flag. That is done to prevent GC
+		 * from touching this host.
+		 */
+		if (hostp->nh_flags & NLM_NH_INIDLE) {
+			TAILQ_REMOVE(&g->nlm_idle_hosts, hostp, nh_link);
+			hostp->nh_flags &= ~NLM_NH_INIDLE;
+		}
+
+		hostp->nh_refs++;
+		TAILQ_INSERT_TAIL(&all_hosts, hostp, nh_link);
+	}
+
+	/*
+	 * Now we can walk through all hosts on the system
+	 * with zone globals lock released. The fact the
+	 * we have taken a reference to each host guaranties
+	 * that no hosts can be destroyed during that process.
+	 */
+	mutex_exit(&g->lock);
+	while ((hostp = TAILQ_FIRST(&all_hosts)) != NULL) {
+		mutex_enter(&hostp->nh_lock);
+		if (nlm_host_has_locks(hostp))
+			hostp->nh_flags |= NLM_NH_SUSPEND;
+
+		mutex_exit(&hostp->nh_lock);
+		TAILQ_REMOVE(&all_hosts, hostp, nh_link);
+	}
+}
+
+/*
+ * Resume NLM hosts for the given zone.
+ *
+ * nlm_resume_zone() is called after hosts were suspended
+ * (see nlm_suspend_zone) and its main purpose to check
+ * whether remote locks owned by hosts are still in consistent
+ * state. If they aren't, resume function tries to reclaim
+ * reclaim locks (for client side hosts) and clean locks (for
+ * server side hosts).
+ */
+static void
+nlm_resume_zone(struct nlm_globals *g)
+{
+	struct nlm_host *hostp, *h_next;
+
+	mutex_enter(&g->lock);
+	hostp = avl_first(&g->nlm_hosts_tree);
+
+	/*
+	 * In nlm_suspend_zone() the reference counter of each
+	 * host was incremented, so we can safely iterate through
+	 * all hosts without worrying that any host we touch will
+	 * be removed at the moment.
+	 */
+	while (hostp != NULL) {
+		struct nlm_nsm nsm;
+		enum clnt_stat stat;
+		int32_t sm_state;
+		int error;
+		bool_t resume_failed = FALSE;
+
+		h_next = AVL_NEXT(&g->nlm_hosts_tree, hostp);
+		mutex_exit(&g->lock);
+
+		DTRACE_PROBE1(resume__host, struct nlm_host *, hostp);
+
+		/*
+		 * Suspend operation marked that the host doesn't
+		 * have any locks. Skip it.
+		 */
+		if (!(hostp->nh_flags & NLM_NH_SUSPEND))
+			goto cycle_end;
+
+		error = nlm_nsm_init(&nsm, &hostp->nh_knc, &hostp->nh_addr);
+		if (error != 0) {
+			NLM_ERR("Resume: Failed to contact to NSM of host %s "
+			    "[error=%d]\n", hostp->nh_name, error);
+			resume_failed = TRUE;
+			goto cycle_end;
+		}
+
+		stat = nlm_nsm_stat(&nsm, &sm_state);
+		if (stat != RPC_SUCCESS) {
+			NLM_ERR("Resume: Failed to call SM_STAT operation for "
+			    "host %s [stat=%d]\n", hostp->nh_name, stat);
+			resume_failed = TRUE;
+			nlm_nsm_fini(&nsm);
+			goto cycle_end;
+		}
+
+		if (sm_state != hostp->nh_state) {
+			/*
+			 * Current SM state of the host isn't equal
+			 * to the one host had when it was suspended.
+			 * Probably it was rebooted. Try to reclaim
+			 * locks if the host has any on its client side.
+			 * Also try to clean up its server side locks
+			 * (if the host has any).
+			 */
+			nlm_host_notify_client(hostp, sm_state);
+			nlm_host_notify_server(hostp, sm_state);
+		}
+
+		nlm_nsm_fini(&nsm);
+
+cycle_end:
+		if (resume_failed) {
+			/*
+			 * Resume failed for the given host.
+			 * Just clean up all resources it owns.
+			 */
+			nlm_host_notify_server(hostp, 0);
+			nlm_client_cancel_all(g, hostp);
+		}
+
+		hostp->nh_flags &= ~NLM_NH_SUSPEND;
+		nlm_host_release(g, hostp);
+		hostp = h_next;
+		mutex_enter(&g->lock);
+	}
+
+	mutex_exit(&g->lock);
+}
+
+/*
+ * NLM functions responsible for operations on NSM handle.
+ */
+
+/*
+ * Initialize knetconfig that is used for communication
+ * with local statd via loopback interface.
+ */
+static int
+nlm_init_local_knc(struct knetconfig *knc)
+{
+	int error;
+	vnode_t *vp;
+
+	bzero(knc, sizeof (*knc));
+	error = lookupname("/dev/tcp", UIO_SYSSPACE,
+	    FOLLOW, NULLVPP, &vp);
+	if (error != 0)
+		return (error);
+
+	knc->knc_semantics = NC_TPI_COTS;
+	knc->knc_protofmly = NC_INET;
+	knc->knc_proto = NC_TCP;
+	knc->knc_rdev = vp->v_rdev;
+	VN_RELE(vp);
+
+
+	return (0);
+}
+
+/*
+ * Initialize NSM handle that will be used to talk
+ * to local statd via loopback interface.
+ */
+static int
+nlm_nsm_init_local(struct nlm_nsm *nsm)
+{
+	int error;
+	struct knetconfig knc;
+	struct sockaddr_in sin;
+	struct netbuf nb;
+
+	error = nlm_init_local_knc(&knc);
+	if (error != 0)
+		return (error);
+
+	bzero(&sin, sizeof (sin));
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	sin.sin_family = AF_INET;
+
+	nb.buf = (char *)&sin;
+	nb.len = nb.maxlen = sizeof (sin);
+
+	return (nlm_nsm_init(nsm, &knc, &nb));
+}
+
+/*
+ * Initialize NSM handle used for talking to statd
+ */
+static int
+nlm_nsm_init(struct nlm_nsm *nsm, struct knetconfig *knc, struct netbuf *nb)
+{
 	CLIENT *clnt = NULL;
 	enum clnt_stat stat;
-	int error;
+	int error, retries;
 
-	knc = nlm_knetconfig_from_netid(netid);
-	if (knc == NULL)
-		goto out;
+	bzero(nsm, sizeof (*nsm));
+	nsm->ns_knc = *knc;
+	nlm_copy_netbuf(&nsm->ns_addr, nb);
 
 	/*
-	 * Contact the remote RPCBIND service to find the
-	 * port for this prog+service. NB: modifies *addr
-	 * XXX: Use a copy of the addr. here?
+	 * Try several times to get the port of statd service,
+	 * If rpcbind_getaddr returns  RPC_PROGNOTREGISTERED,
+	 * retry an attempt, but wait for NLM_NSM_RPCBIND_TIMEOUT
+	 * seconds berofore.
 	 */
-	stat = rpcbind_getaddr(knc, prog, vers, addr);
-	if (stat != RPC_SUCCESS)
-		goto out;
+	for (retries = 0; retries < NLM_NSM_RPCBIND_RETRIES; retries++) {
+		stat = rpcbind_getaddr(&nsm->ns_knc, SM_PROG,
+		    SM_VERS, &nsm->ns_addr);
+		if (stat != RPC_SUCCESS) {
+			if (stat == RPC_PROGNOTREGISTERED) {
+				delay(SEC_TO_TICK(NLM_NSM_RPCBIND_TIMEOUT));
+				continue;
+			}
+		}
 
-	error = clnt_tli_kcreate(knc, addr, prog, vers,
-	    0, 0, CRED(), &clnt);
+		break;
+	}
+
+	if (stat != RPC_SUCCESS) {
+		DTRACE_PROBE2(rpcbind__error, enum clnt_stat, stat,
+		    int, retries);
+		error = ENOENT;
+		goto error;
+	}
+
+	/*
+	 * Create a RPC handle that'll be used for
+	 * communication with local statd
+	 */
+	error = clnt_tli_kcreate(&nsm->ns_knc, &nsm->ns_addr, SM_PROG, SM_VERS,
+	    0, NLM_RPC_RETRIES, kcred, &clnt);
 	if (error != 0)
-		clnt = NULL;
+		goto error;
 
-out:
-	if (knc != NULL)
-		nlm_knetconfig_rele(knc);
-	return (clnt);
-}
+	nsm->ns_handle = clnt;
+	sema_init(&nsm->ns_sem, 1, NULL, SEMA_DEFAULT, NULL);
+	return (0);
 
+error:
+	kmem_free(nsm->ns_addr.buf, nsm->ns_addr.maxlen);
+	if (clnt)
+		CLNT_DESTROY(clnt);
 
-/*
- * Find or create an nlm_vnode.
- * See comments at struct nlm_vnode def.
- */
-struct nlm_vnode *
-nlm_vnode_findcreate(struct nlm_host *host, struct netobj *n)
-{
-	fhandle_t *fhp;
-	vnode_t *vp;
-	struct nlm_vnode *nv, *new_nv;
-
-	/*
-	 * Get a vnode pointer for the given NFS file handle.
-	 * Note that it could be an NFSv2 for NFSv3 handle,
-	 * which means the size might vary.  (don't copy)
-	 */
-	if (n->n_len < sizeof (*fhp))
-		return (NULL);
-	/* We know this is aligned (mem_alloc) */
-	/* LINTED: alignment */
-	fhp = (fhandle_t *)n->n_bytes;
-	vp = lm_fhtovp(fhp);
-	if (vp == NULL)
-		return (NULL);
-	/* Note: VN_HOLD from fhtovp */
-
-	/* XXX: maybe use a kmem_cache? */
-	new_nv = kmem_zalloc(sizeof (*new_nv), KM_SLEEP);
-
-	mutex_enter(&host->nh_lock);
-
-	TAILQ_FOREACH(nv, &host->nh_vnodes, nv_link) {
-		if (nv->nv_vp == vp)
-			break;
-	}
-	if (nv != NULL) {
-		/*
-		 * Found existing entry.  We already did a VN_HOLD
-		 * when we created this entry. Just bump refs.
-		 */
-		kmem_free(new_nv, sizeof (*new_nv));
-		nv->nv_refs++;
-		mutex_exit(&host->nh_lock);
-		/* Give up the hold from fhtovp */
-		VN_RELE(vp);
-		return (nv);
-	}
-	/* Add an entry. */
-	nv = new_nv;
-	nv->nv_refs = 1;
-	nv->nv_vp = vp;		/* Keep hold from fhtovp */
-	TAILQ_INSERT_TAIL(&host->nh_vnodes, nv, nv_link);
-
-	mutex_exit(&host->nh_lock);
-
-	return (nv);
-}
-
-void
-nlm_vnode_release(struct nlm_host *host, struct nlm_vnode *nv)
-{
-	/* XXX	struct nlm_vnode *dead_nv = NULL; */
-
-	if (nv == NULL)
-		return;
-
-	mutex_enter(&host->nh_lock);
-
-	nv->nv_refs--;
-
-	/*
-	 * We don't have an inexpensive way to find out if
-	 * this client has locks on this vnode, but need to
-	 * keep it active while this client has any locks.
-	 * (Counting locks and unlocks won't work because
-	 * those are not required to balance.)
-	 *
-	 * Current solution:  Just keep vnodes held until
-	 * this host struct reaches its idle timeout.
-	 */
-#if 0	/* XXX */
-	if (nv->nv_refs == 0) {
-		TAILQ_REMOVE(&host->nh_vnodes, nv, nv_link);
-		dead_nv = nv;
-	}
-#endif	/* XXX */
-
-	mutex_exit(&host->nh_lock);
-
-#if 0	/* XXX */
-	if (dead_nv != NULL) {
-		VN_RELE(old_nv->nv_vp);
-		kmem_free(old_nv, sizeof (*old_nv));
-	}
-#endif	/* XXX */
-}
-
-/*
- * In the BSD code, this was called in the context of the
- * F_UNLCK caller that allowed our F_SETLKW to succeed.
- * Here, F_SETLKW is done from the RPC service thread in a way
- * that allows it to simply blocks in the F_SETLK call.
- * XXX: We probably don't need this function.
- */
-#if 0 /* XXX */
-static void
-nlm_lock_callback(flk_cb_when_t when, void *arg)
-{
-	struct nlm_async_lock *af = (struct nlm_async_lock *)arg;
-
-}
-#endif
-
-/*
- * Free an async lock request. The request must have been removed from
- * any list.
- */
-void
-nlm_free_async_lock(struct nlm_async_lock *af)
-{
-	/*
-	 * Free an async lock.
-	 */
-#if 0
-	if (af->af_rpc)
-		CLNT_RELEASE(af->af_rpc);
-	xdr_free((xdrproc_t)xdr_nlm4_testargs, (void *)&af->af_granted);
-#endif
-	if (af->af_vp)
-		VN_RELE(af->af_vp);
-	kmem_free(af, sizeof (*af));
-}
-
-/*
- * Cancel our async request - this must be called with
- * af->nh_host->nh_lock held.
- */
-int
-nlm_cancel_async_lock(struct nlm_async_lock *af)
-{
-	struct flock64 fl;
-	struct nlm_host *host;
-	vnode_t *vp;
-	int error, flags;
-
-	/* Save these while locked. */
-	host = af->af_host;
-	vp = af->af_vp;
-	fl = af->af_fl;		/* struct! */
-
-	ASSERT(MUTEX_HELD(&host->nh_lock));
-
-	mutex_exit(&host->nh_lock);
-
-	/*
-	 * BSD: VOP_ADVLOCKASYNC(af->af_vp, NULL, F_CANCEL, &af->af_fl,
-	 * F_REMOTE, NULL, &af->af_cookie);
-	 */
-
-	/*
-	 * Interesting os/flock.c feature:
-	 * Blocked F_SETLKW calls can be cancelled by an
-	 * F_UNLCK of exactly the same flock information.
-	 */
-	fl.l_type = F_UNLCK;
-	flags = F_REMOTELOCK | FREAD | FWRITE;
-	error = VOP_FRLOCK(vp, F_SETLK, &fl, flags,
-	    (u_offset_t)0, NULL, CRED(), NULL);
-
-	mutex_enter(&host->nh_lock);
-
-	/*
-	 * This af is removed from the list by the
-	 * blocking thread (see nlm_block).
-	 */
 	return (error);
 }
 
-/*
- * Cancel pending blocked locks for this client.
- */
 static void
-nlm_destroy_client_pending(struct nlm_host *host)
+nlm_nsm_fini(struct nlm_nsm *nsm)
 {
-	struct nlm_async_lock *af, *next_af;
+	kmem_free(nsm->ns_addr.buf, nsm->ns_addr.maxlen);
+	CLNT_DESTROY(nsm->ns_handle);
+	nsm->ns_handle = NULL;
+	sema_destroy(&nsm->ns_sem);
+}
 
-	ASSERT(MUTEX_HELD(&host->nh_lock));
+static enum clnt_stat
+nlm_nsm_simu_crash(struct nlm_nsm *nsm)
+{
+	enum clnt_stat stat;
+
+	sema_v(&nsm->ns_sem);
+	stat = sm_simu_crash_1(NULL, NULL, nsm->ns_handle);
+	sema_p(&nsm->ns_sem);
+
+	return (stat);
+}
+
+static enum clnt_stat
+nlm_nsm_stat(struct nlm_nsm *nsm, int32_t *out_stat)
+{
+	struct sm_name args;
+	struct sm_stat_res res;
+	enum clnt_stat stat;
+
+	args.mon_name = uts_nodename();
+	bzero(&res, sizeof (res));
+
+	sema_v(&nsm->ns_sem);
+	stat = sm_stat_1(&args, &res, nsm->ns_handle);
+	if (stat != RPC_SUCCESS) {
+		sema_p(&nsm->ns_sem);
+		return (stat);
+	}
+
+	sema_p(&nsm->ns_sem);
+	*out_stat = res.state;
+
+	return (stat);
+}
+
+static enum clnt_stat
+nlm_nsm_mon(struct nlm_nsm *nsm, char *hostname, uint16_t priv)
+{
+	struct mon args;
+	struct sm_stat_res res;
+	enum clnt_stat stat;
+
+	bzero(&args, sizeof (args));
+	bzero(&res, sizeof (res));
+
+	args.mon_id.mon_name = hostname;
+	args.mon_id.my_id.my_name = uts_nodename();
+	args.mon_id.my_id.my_prog = NLM_PROG;
+	args.mon_id.my_id.my_vers = NLM_SM;
+	args.mon_id.my_id.my_proc = NLM_SM_NOTIFY1;
+	bcopy(&priv, args.priv, sizeof (priv));
+
+	sema_v(&nsm->ns_sem);
+	stat = sm_mon_1(&args, &res, nsm->ns_handle);
+	sema_p(&nsm->ns_sem);
+
+	return (stat);
+}
+
+static enum clnt_stat
+nlm_nsm_unmon(struct nlm_nsm *nsm, char *hostname)
+{
+	struct mon_id args;
+	struct sm_stat res;
+	enum clnt_stat stat;
+
+	bzero(&args, sizeof (args));
+	bzero(&res, sizeof (res));
+
+	args.mon_name = hostname;
+	args.my_id.my_name = uts_nodename();
+	args.my_id.my_prog = NLM_PROG;
+	args.my_id.my_vers = NLM_SM;
+	args.my_id.my_proc = NLM_SM_NOTIFY1;
+
+	sema_v(&nsm->ns_sem);
+	stat = sm_unmon_1(&args, &res, nsm->ns_handle);
+	sema_p(&nsm->ns_sem);
+
+	return (stat);
+}
+
+/*
+ * Get NLM vhold object corresponding to vnode "vp".
+ * If no such object was found, create a new one.
+ *
+ * The purpose of this function is to associate vhold
+ * object with given vnode, so that:
+ * 1) vnode is hold (VN_HOLD) while vhold object is alive.
+ * 2) host has a track of all vnodes it touched by lock
+ *    or share operations. These vnodes are accessible
+ *    via collection of vhold objects.
+ */
+struct nlm_vhold *
+nlm_vhold_get(struct nlm_host *hostp, vnode_t *vp)
+{
+	struct nlm_vhold *nvp, *new_nvp = NULL;
+
+	mutex_enter(&hostp->nh_lock);
+	nvp = nlm_vhold_find_locked(hostp, vp);
+	if (nvp != NULL)
+		goto out;
+
+	/* nlm_vhold wasn't found, then create a new one */
+	mutex_exit(&hostp->nh_lock);
+	new_nvp = kmem_cache_alloc(nlm_vhold_cache, KM_SLEEP);
 
 	/*
-	 * Cancel all blocked lock requests.
-	 * The blocked threads will cleanup.
+	 * Check if another thread has already
+	 * created the same nlm_vhold.
 	 */
-	af = TAILQ_FIRST(&host->nh_pending);
-	while (af != NULL) {
-		next_af = TAILQ_NEXT(af, af_link);
-		(void) nlm_cancel_async_lock(af);
-		af = next_af;
+	mutex_enter(&hostp->nh_lock);
+	nvp = nlm_vhold_find_locked(hostp, vp);
+	if (nvp == NULL) {
+		nvp = new_nvp;
+		new_nvp = NULL;
+
+		TAILQ_INIT(&nvp->nv_slreqs);
+		nvp->nv_vp = vp;
+		nvp->nv_refcnt = 1;
+		VN_HOLD(nvp->nv_vp);
+
+		VERIFY(mod_hash_insert(hostp->nh_vholds_by_vp,
+		    (mod_hash_key_t)vp, (mod_hash_val_t)nvp) == 0);
+		TAILQ_INSERT_TAIL(&hostp->nh_vholds_list, nvp, nv_link);
 	}
+
+out:
+	mutex_exit(&hostp->nh_lock);
+	if (new_nvp != NULL)
+		kmem_cache_free(nlm_vhold_cache, new_nvp);
+
+	return (nvp);
 }
 
 /*
- * Destroy any locks the client holds.
- * Do F_UNLKSYS on all it's vnodes.
+ * Drop a reference to vhold object nvp.
  */
-static void
-nlm_destroy_client_locks(struct nlm_host *host)
+void
+nlm_vhold_release(struct nlm_host *hostp, struct nlm_vhold *nvp)
 {
-	struct nlm_vnode *nv;
-	struct flock64 fl;
-	int flags;
+	if (nvp == NULL)
+		return;
 
-	ASSERT(MUTEX_HELD(&host->nh_lock));
-
-	bzero(&fl, sizeof (fl));
-	fl.l_type = F_UNLKSYS;
-	fl.l_sysid = host->nh_sysid;
-	flags = F_REMOTELOCK | FREAD | FWRITE;
-
-	TAILQ_FOREACH(nv, &host->nh_vnodes, nv_link) {
-		(void) VOP_FRLOCK(nv->nv_vp, F_SETLK, &fl,
-		    flags, 0, NULL, CRED(), NULL);
-	}
+	mutex_enter(&hostp->nh_lock);
+	ASSERT(nvp->nv_refcnt > 0);
+	nvp->nv_refcnt--;
+	mutex_exit(&hostp->nh_lock);
 }
 
+/*
+ * Clean all locks and share reservations on the
+ * given vhold object that were acquired by the
+ * given sysid
+ */
+static void
+nlm_vhold_clean(struct nlm_vhold *nvp, int sysid)
+{
+	cleanlocks(nvp->nv_vp, IGN_PID, sysid);
+	cleanshares_by_sysid(nvp->nv_vp, sysid);
+}
+
+static void
+nlm_vhold_destroy(struct nlm_host *hostp, struct nlm_vhold *nvp)
+{
+	ASSERT(MUTEX_HELD(&hostp->nh_lock));
+
+	VERIFY(mod_hash_remove(hostp->nh_vholds_by_vp,
+	    (mod_hash_key_t)nvp->nv_vp,
+	    (mod_hash_val_t)&nvp) == 0);
+
+	TAILQ_REMOVE(&hostp->nh_vholds_list, nvp, nv_link);
+	VN_RELE(nvp->nv_vp);
+	nvp->nv_vp = NULL;
+
+	kmem_cache_free(nlm_vhold_cache, nvp);
+}
+
+/*
+ * Return TRUE if the given vhold is busy.
+ * Vhold object is considered to be "busy" when
+ * all the following conditions hold:
+ * 1) No one uses it at the moment;
+ * 2) It hasn't any locks;
+ * 3) It hasn't any share reservations;
+ */
+static bool_t
+nlm_vhold_busy(struct nlm_host *hostp, struct nlm_vhold *nvp)
+{
+	vnode_t *vp;
+	int sysid;
+
+	ASSERT(MUTEX_HELD(&hostp->nh_lock));
+
+	if (nvp->nv_refcnt > 0)
+		return (TRUE);
+
+	vp = nvp->nv_vp;
+	sysid = nlm_host_get_sysid(hostp);
+	if (flk_has_remote_locks_for_sysid(vp, sysid) ||
+	    shr_has_remote_shares(vp, sysid))
+		return (TRUE);
+
+	return (FALSE);
+}
+
+/* ARGSUSED */
+static int
+nlm_vhold_ctor(void *datap, void *cdrarg, int kmflags)
+{
+	struct nlm_vhold *nvp = (struct nlm_vhold *)datap;
+
+	bzero(nvp, sizeof (*nvp));
+	return (0);
+}
+
+/* ARGSUSED */
+static void
+nlm_vhold_dtor(void *datap, void *cdrarg)
+{
+	struct nlm_vhold *nvp = (struct nlm_vhold *)datap;
+
+	ASSERT(nvp->nv_refcnt == 0);
+	ASSERT(TAILQ_EMPTY(&nvp->nv_slreqs));
+	ASSERT(nvp->nv_vp == NULL);
+}
+
+struct nlm_vhold *
+nlm_vhold_find_locked(struct nlm_host *hostp, const vnode_t *vp)
+{
+	struct nlm_vhold *nvp = NULL;
+
+	ASSERT(MUTEX_HELD(&hostp->nh_lock));
+	(void) mod_hash_find(hostp->nh_vholds_by_vp,
+	    (mod_hash_key_t)vp,
+	    (mod_hash_val_t)&nvp);
+
+	if (nvp != NULL)
+		nvp->nv_refcnt++;
+
+	return (nvp);
+}
+
+/*
+ * NLM host functions
+ */
+static void
+nlm_copy_netbuf(struct netbuf *dst, struct netbuf *src)
+{
+	ASSERT(src->len <= src->maxlen);
+
+	dst->maxlen = src->maxlen;
+	dst->len = src->len;
+	dst->buf = kmem_zalloc(src->maxlen, KM_SLEEP);
+	bcopy(src->buf, dst->buf, src->len);
+}
+
+/* ARGSUSED */
+static int
+nlm_host_ctor(void *datap, void *cdrarg, int kmflags)
+{
+	struct nlm_host *hostp = (struct nlm_host *)datap;
+
+	bzero(hostp, sizeof (*hostp));
+	return (0);
+}
+
+/* ARGSUSED */
+static void
+nlm_host_dtor(void *datap, void *cdrarg)
+{
+	struct nlm_host *hostp = (struct nlm_host *)datap;
+	ASSERT(hostp->nh_refs == 0);
+}
+
+static void
+nlm_host_unregister(struct nlm_globals *g, struct nlm_host *hostp)
+{
+	ASSERT(hostp->nh_refs == 0);
+
+	avl_remove(&g->nlm_hosts_tree, hostp);
+	VERIFY(mod_hash_remove(g->nlm_hosts_hash,
+	    (mod_hash_key_t)(uintptr_t)hostp->nh_sysid,
+	    (mod_hash_val_t)&hostp) == 0);
+	TAILQ_REMOVE(&g->nlm_idle_hosts, hostp, nh_link);
+	hostp->nh_flags &= ~NLM_NH_INIDLE;
+}
 
 /*
  * Free resources used by a host. This is called after the reference
  * count has reached zero so it doesn't need to worry about locks.
  */
 static void
-nlm_host_destroy(struct nlm_host *host)
+nlm_host_destroy(struct nlm_host *hostp)
 {
+	ASSERT(hostp->nh_name != NULL);
+	ASSERT(hostp->nh_netid != NULL);
+	ASSERT(TAILQ_EMPTY(&hostp->nh_vholds_list));
 
-	if (host->nh_srvrpc.nr_client)
-		CLNT_RELEASE(host->nh_srvrpc.nr_client);
-	if (host->nh_clntrpc.nr_client)
-		CLNT_RELEASE(host->nh_clntrpc.nr_client);
+	strfree(hostp->nh_name);
+	strfree(hostp->nh_netid);
+	kmem_free(hostp->nh_addr.buf, hostp->nh_addr.maxlen);
 
-	if (host->nh_name)
-		strfree(host->nh_name);
-	if (host->nh_netid)
-		strfree(host->nh_netid);
-	if (host->nh_addr.buf != NULL)
-		kmem_free(host->nh_addr.buf, host->nh_addr.maxlen);
+	if (hostp->nh_sysid != LM_NOSYSID)
+		nlm_sysid_free(hostp->nh_sysid);
 
-	mutex_destroy(&host->nh_lock);
-	/* sysctl_ctx_free(&host->nh_sysctl); XXX */
-	kmem_free(host, sizeof (*host));
-}
+	nlm_rpc_cache_destroy(hostp);
 
-void
-nlm_set_recovery_cb(recovery_cb func)
-{
-	nlm_recovery_func = func;
-}
+	ASSERT(TAILQ_EMPTY(&hostp->nh_vholds_list));
+	mod_hash_destroy_ptrhash(hostp->nh_vholds_by_vp);
 
+	mutex_destroy(&hostp->nh_lock);
+	cv_destroy(&hostp->nh_rpcb_cv);
+	cv_destroy(&hostp->nh_recl_cv);
 
-/*
- * Thread start callback for client lock recovery
- */
-static void
-nlm_client_recovery_start(void *arg)
-{
-	struct nlm_host *host = (struct nlm_host *)arg;
-
-	NLM_DEBUG(1, "NLM: client lock recovery for %s started\n",
-	    host->nh_name);
-
-	/* nlm_client_recovery(host); */
-	if (nlm_recovery_func != NULL)
-		(*nlm_recovery_func)(host);
-
-	NLM_DEBUG(1, "NLM: client lock recovery for %s completed\n",
-	    host->nh_name);
-
-	host->nh_monstate = NLM_MONITORED;
-
-	/* Note: refcnt was incremented before this thread started. */
-	nlm_host_release(host);
-
-	/* XXX kthread_exit(); */
+	kmem_cache_free(nlm_hosts_cache, hostp);
 }
 
 /*
  * Cleanup SERVER-side state after a client restarts,
  * or becomes unresponsive, or whatever.
  *
- * This is called by the local NFS statd when we receive a
- * host state change notification.  (also nlm_svc_stopping)
- * XXX: Does NFS statd call us only after host restart?
+ * We unlock any active locks owned by the host.
+ * When rpc.lockd is shutting down,
+ * this function is called with newstate set to zero
+ * which allows us to cancel any pending async locks
+ * and clear the locking state.
  *
- * We unlock any active locks owned by the host. When rpc.lockd is
- * shutting down, this function is called with newstate set to zero
- * which allows us to cancel any pending async locks and clear the
- * locking state.
+ * When "state" is 0, we don't update host's state,
+ * but cleanup all remote locks on the host.
+ * It's useful to call this function for resources
+ * cleanup.
  */
 void
-nlm_host_notify_server(struct nlm_host *host, int newstate)
+nlm_host_notify_server(struct nlm_host *hostp, int32_t state)
 {
+	struct nlm_vhold *nvp;
+	struct nlm_slreq *slr;
+	struct nlm_slreq_list slreqs2free;
+	int sysid;
 
-	if (newstate) {
-		NLM_DEBUG(1, "NLM: host %s (sysid %d) rebooted, new "
-		    "state is %d\n", host->nh_name,
-		    host->nh_sysid, newstate);
+	TAILQ_INIT(&slreqs2free);
+	mutex_enter(&hostp->nh_lock);
+	if (state != 0)
+		hostp->nh_state = state;
+
+	sysid = nlm_host_get_sysid(hostp);
+	TAILQ_FOREACH(nvp, &hostp->nh_vholds_list, nv_link) {
+
+		/* cleanup sleeping requests at first */
+		while ((slr = TAILQ_FIRST(&nvp->nv_slreqs)) != NULL) {
+			TAILQ_REMOVE(&nvp->nv_slreqs, slr, nsr_link);
+
+			/*
+			 * Instead of freeing cancelled sleeping request
+			 * here, we add it to the linked list created
+			 * on the stack in order to do all frees outside
+			 * the critical section.
+			 */
+			TAILQ_INSERT_TAIL(&slreqs2free, slr, nsr_link);
+		}
+
+		nvp->nv_refcnt++;
+		mutex_exit(&hostp->nh_lock);
+
+		nlm_vhold_clean(nvp, sysid);
+
+		mutex_enter(&hostp->nh_lock);
+		nvp->nv_refcnt--;
 	}
 
-	/*
-	 * Cleanup for a "crashed" NFS client.
-	 * (For whom we are the server.)
-	 */
-
-	mutex_enter(&host->nh_lock);
-
-	nlm_destroy_client_pending(host);
-	nlm_destroy_client_locks(host);
-
-	host->nh_state = newstate;
-
-	mutex_exit(&host->nh_lock);
+	mutex_exit(&hostp->nh_lock);
+	while ((slr = TAILQ_FIRST(&slreqs2free)) != NULL) {
+		TAILQ_REMOVE(&slreqs2free, slr, nsr_link);
+		kmem_free(slr, sizeof (*slr));
+	}
 }
 
 /*
@@ -636,151 +1215,356 @@ nlm_host_notify_server(struct nlm_host *host, int newstate)
  * star the "recovery" process to reclaim any locks
  * we hold on this server.
  */
-
 void
-nlm_host_notify_client(struct nlm_host *host)
+nlm_host_notify_client(struct nlm_host *hostp, int32_t state)
 {
+	mutex_enter(&hostp->nh_lock);
+	hostp->nh_state = state;
+	if (hostp->nh_flags & NLM_NH_RECLAIM) {
+		/*
+		 * Either host's state is up to date or
+		 * host is already in recovery.
+		 */
+		mutex_exit(&hostp->nh_lock);
+		return;
+	}
+
+	hostp->nh_flags |= NLM_NH_RECLAIM;
 
 	/*
-	 * XXX: Walk list of locks...
-	 *   where we own it, and on system H,
-	 *      count++
-	 *
-	 * See: flk_get_active_locks(sysid, NOPID);
-
-XXX More porting work.  We only want there to ever be one recovery
-thread running for each host.  So, we can let the host object carry
-state about the recovery thread running, if any, etc.
-
-So, here:  (a) check if there's a recovery thread yet, and if not,
-mark that one is starting.  (b) get the list of locks for this sysid.
-if no locks, mark recovery complete now and don't bother starting the
-recovery thread.  If there are some locks, store that list in the host
-object and start the recovery thread.  mark recovery as 'running'.
-
+	 * Host will be released by the recovery thread,
+	 * thus we need to increment refcount.
 	 */
-	if (host->nh_monstate != NLM_RECOVERING &&
-	    lf_countlocks(NLM_SYSID_CLIENT | host->nh_sysid) > 0) {
+	hostp->nh_refs++;
+	mutex_exit(&hostp->nh_lock);
 
-		/* XXX: Use a dynamic taskq here? */
-
-		struct thread *td;
-		host->nh_monstate = NLM_RECOVERING;
-
-		/* rele this ref. i nlm_client_recovery_start */
-		atomic_inc_uint(&host->nh_refs);
-
-		kthread_add(nlm_client_recovery_start, host, curproc, &td, 0, 0,
-		    "NFS lock recovery for %s", host->nh_name);
-	}
+	(void) zthread_create(NULL, 0, nlm_reclaimer,
+	    hostp, 0, minclsyspri);
 }
 
+/*
+ * The function is called when NLM client detects that
+ * server has entered in grace period and client needs
+ * to wait until reclamation process (if any) does
+ * its job.
+ */
+int
+nlm_host_wait_grace(struct nlm_host *hostp)
+{
+	struct nlm_globals *g;
+	int error = 0;
+
+	g = zone_getspecific(nlm_zone_key, curzone);
+	mutex_enter(&hostp->nh_lock);
+
+	do {
+		int rc;
+
+		rc = cv_timedwait_sig(&hostp->nh_recl_cv,
+		    &hostp->nh_lock, ddi_get_lbolt() +
+		    SEC_TO_TICK(g->retrans_tmo));
+
+		if (rc == 0) {
+			error = EINTR;
+			break;
+		}
+	} while (hostp->nh_flags & NLM_NH_RECLAIM);
+
+	mutex_exit(&hostp->nh_lock);
+	return (error);
+}
 
 /*
  * Create a new NLM host.
+ *
+ * NOTE: The in-kernel RPC (kRPC) subsystem uses TLI/XTI,
+ * which needs both a knetconfig and an address when creating
+ * endpoints. Thus host object stores both knetconfig and
+ * netid.
  */
 static struct nlm_host *
-nlm_create_host(char *name, const char *netid, struct netbuf *addr)
+nlm_host_create(char *name, const char *netid,
+    struct knetconfig *knc, struct netbuf *naddr)
 {
 	struct nlm_host *host;
 
-	ASSERT(MUTEX_HELD(&nlm_global_lock));
+	host = kmem_cache_alloc(nlm_hosts_cache, KM_SLEEP);
 
-	host = kmem_zalloc(sizeof (*host), KM_SLEEP);
+	mutex_init(&host->nh_lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&host->nh_rpcb_cv, NULL, CV_DEFAULT, NULL);
+	cv_init(&host->nh_recl_cv, NULL, CV_DEFAULT, NULL);
 
-	mutex_init(&host->nh_lock, "nh_lock", MUTEX_DEFAULT, NULL);
+	host->nh_sysid = LM_NOSYSID;
 	host->nh_refs = 1;
-
 	host->nh_name = strdup(name);
 	host->nh_netid = strdup(netid);
-	nlm_copy_netbuf(&host->nh_addr, addr);
+	host->nh_knc = *knc;
+	nlm_copy_netbuf(&host->nh_addr, naddr);
 
 	host->nh_state = 0;
-	host->nh_monstate = NLM_UNMONITORED;
+	host->nh_rpcb_state = NRPCB_NEED_UPDATE;
 
-	TAILQ_INIT(&host->nh_vnodes);
-	TAILQ_INIT(&host->nh_pending);
+	host->nh_vholds_by_vp = mod_hash_create_ptrhash("nlm vholds hash",
+	    32, mod_hash_null_valdtor, sizeof (vnode_t));
+
+	TAILQ_INIT(&host->nh_vholds_list);
+	TAILQ_INIT(&host->nh_rpchc);
 
 	return (host);
 }
 
 /*
- * Acquire the next sysid for remote locks not handled by the NLM.
+ * Cancel all client side sleeping locks owned by given host.
  */
-uint32_t
-nlm_acquire_next_sysid(void)
+void
+nlm_host_cancel_slocks(struct nlm_globals *g, struct nlm_host *hostp)
 {
-	uint32_t next_sysid;
+	struct nlm_slock *nslp;
 
-	mutex_enter(&nlm_global_lock);
-	next_sysid = nlm_next_sysid++;
-	mutex_exit(&nlm_global_lock);
-	return (next_sysid);
+	mutex_enter(&g->lock);
+	TAILQ_FOREACH(nslp, &g->nlm_slocks, nsl_link) {
+		if (nslp->nsl_host == hostp) {
+			nslp->nsl_state = NLM_SL_CANCELLED;
+			cv_broadcast(&nslp->nsl_cond);
+		}
+	}
+
+	mutex_exit(&g->lock);
 }
 
-
 /*
- * Check for idle hosts and stop monitoring them. We could also free
- * the host structure here, possibly after a larger timeout but that
- * would require some care to avoid races with
- * e.g. nlm_host_lock_count_sysctl.
+ * Garbage collect stale vhold objects.
+ *
+ * In other words check whether vnodes that are
+ * held by vnold objects still have any locks
+ * or shares or still in use. If they aren't,
+ * just destroy them.
  */
 static void
-nlm_check_idle(void)
+nlm_host_gc_vholds(struct nlm_host *hostp)
 {
-	struct nlm_host *host;
-	clock_t time_uptime, new_timeout;
+	struct nlm_vhold *nvp;
 
-	ASSERT(MUTEX_HELD(&nlm_global_lock));
+	ASSERT(MUTEX_HELD(&hostp->nh_lock));
 
-	time_uptime = ddi_get_lbolt();
-	if (time_uptime <= nlm_next_idle_check)
-		return;
-	nlm_next_idle_check = time_uptime +
-	    SEC_TO_TICK(NLM_IDLE_PERIOD);
-	new_timeout = time_uptime +
-	    SEC_TO_TICK(NLM_IDLE_TIMEOUT);
+	nvp = TAILQ_FIRST(&hostp->nh_vholds_list);
+	while (nvp != NULL) {
+		struct nlm_vhold *nvp_tmp;
 
-	TAILQ_FOREACH(host, &nlm_hosts, nh_link) {
-		if (host->nh_monstate == NLM_MONITORED &&
-		    time_uptime > host->nh_idle_timeout) {
-			mutex_exit(&nlm_global_lock);
-			if (lf_countlocks(host->nh_sysid) > 0 ||
-			    lf_countlocks(NLM_SYSID_CLIENT +
-			    host->nh_sysid)) {
-				host->nh_idle_timeout = new_timeout;
-				mutex_enter(&nlm_global_lock);
-				continue;
-			}
-			nlm_host_unmonitor(host);
-			mutex_enter(&nlm_global_lock);
+		if (nlm_vhold_busy(hostp, nvp)) {
+			nvp = TAILQ_NEXT(nvp, nv_link);
+			continue;
 		}
+
+		nvp_tmp = TAILQ_NEXT(nvp, nv_link);
+		nlm_vhold_destroy(hostp, nvp);
+		nvp = nvp_tmp;
 	}
 }
 
+/*
+ * Check whether the given host has any
+ * server side locks or share reservations.
+ */
+static bool_t
+nlm_host_has_srv_locks(struct nlm_host *hostp)
+{
+	/*
+	 * It's cheap and simple: if server has
+	 * any locks/shares there must be vhold
+	 * object storing the affected vnode.
+	 *
+	 * NOTE: We don't need to check sleeping
+	 * locks on the server side, because if
+	 * server side sleeping lock is alive,
+	 * there must be a vhold object corresponding
+	 * to target vnode.
+	 */
+	ASSERT(MUTEX_HELD(&hostp->nh_lock));
+	if (!TAILQ_EMPTY(&hostp->nh_vholds_list))
+		return (TRUE);
+
+	return (FALSE);
+}
+
+/*
+ * Check whether the given host has any client side
+ * locks or share reservations.
+ */
+static bool_t
+nlm_host_has_cli_locks(struct nlm_host *hostp)
+{
+	ASSERT(MUTEX_HELD(&hostp->nh_lock));
+
+	/*
+	 * XXX: It's not the way I'd like to do the check,
+	 * because flk_sysid_has_locks() can be very
+	 * expensive by design. Unfortunatelly it iterates
+	 * throght all locks on the system, doesn't matter
+	 * were they made on remote system via NLM or
+	 * on local system via reclock. To understand the
+	 * problem, consider that there're dozens of thousands
+	 * of locks that are made on some ZFS dataset. And there's
+	 * another dataset shared by NFS where NLM client had locks
+	 * some time ago, but doesn't have them now.
+	 * In this case flk_sysid_has_locks() will iterate
+	 * thrught dozens of thousands locks until it returns us
+	 * FALSE.
+	 * Oh, I hope that in shiny future somebody will make
+	 * local lock manager (os/flock.c) better, so that
+	 * it'd be more friedly to remote locks and
+	 * flk_sysid_has_locks() wouldn't be so expensive.
+	 */
+	if (flk_sysid_has_locks(nlm_host_get_sysid(hostp) |
+	    LM_SYSID_CLIENT, FLK_QUERY_ACTIVE))
+		return (TRUE);
+
+	/*
+	 * Check whether host has any share reservations
+	 * registered on the client sied.
+	 */
+	if (hostp->nh_shrlist != NULL)
+		return (TRUE);
+
+	return (FALSE);
+}
+
+/*
+ * Determine whether the given host owns any
+ * locks or share reservations.
+ */
+static bool_t
+nlm_host_has_locks(struct nlm_host *hostp)
+{
+	if (nlm_host_has_srv_locks(hostp))
+		return (TRUE);
+
+	return (nlm_host_has_cli_locks(hostp));
+}
+
+/*
+ * This function compares only addresses of two netbufs
+ * that belong to NC_TCP[6] or NC_UDP[6] protofamily.
+ * Port part of netbuf is ignored.
+ *
+ * Return values:
+ *  -1: nb1's address is "smaller" than nb2's
+ *   0: addresses are equal
+ *   1: nb1's address is "greater" than nb2's
+ */
+static int
+nlm_netbuf_addrs_cmp(struct netbuf *nb1, struct netbuf *nb2)
+{
+	union nlm_addr {
+		struct sockaddr sa;
+		struct sockaddr_in sin;
+		struct sockaddr_in6 sin6;
+	} *na1, *na2;
+	int res;
+
+	na1 = (union nlm_addr *)nb1->buf;
+	na2 = (union nlm_addr *)nb2->buf;
+
+	if (na1->sa.sa_family < na2->sa.sa_family)
+		return (-1);
+	if (na1->sa.sa_family > na2->sa.sa_family)
+		return (1);
+
+	switch (na1->sa.sa_family) {
+	case AF_INET:
+		res = bcmp(&na1->sin.sin_addr, &na2->sin.sin_addr,
+		    sizeof (na1->sin.sin_addr));
+		break;
+	case AF_INET6:
+		res = bcmp(&na1->sin6.sin6_addr, &na2->sin6.sin6_addr,
+		    sizeof (na1->sin6.sin6_addr));
+		break;
+	default:
+		VERIFY(0);
+		break;
+	}
+
+	return (SIGN(res));
+}
+
+/*
+ * Compare two nlm hosts.
+ * Return values:
+ * -1: host1 is "smaller" than host2
+ *  0: host1 is equal to host2
+ *  1: host1 is "greater" than host2
+ */
+int
+nlm_host_cmp(const void *p1, const void *p2)
+{
+	struct nlm_host *h1 = (struct nlm_host *)p1;
+	struct nlm_host *h2 = (struct nlm_host *)p2;
+	int res;
+
+	res = strcmp(h1->nh_netid, h2->nh_netid);
+	if (res != 0)
+		return (SIGN(res));
+
+	res = nlm_netbuf_addrs_cmp(&h1->nh_addr, &h2->nh_addr);
+	return (res);
+}
 
 /*
  * Find the host specified by...  (see below)
  * If found, increment the ref count.
  */
 static struct nlm_host *
-nlm_host_find_locked(char *name, const char *netid, struct netbuf *addr)
+nlm_host_find_locked(struct nlm_globals *g, const char *netid,
+    struct netbuf *naddr, avl_index_t *wherep)
 {
-	struct nlm_host *host;
+	struct nlm_host *hostp, key;
+	avl_index_t pos;
 
-	ASSERT(MUTEX_HELD(&nlm_global_lock));
+	ASSERT(MUTEX_HELD(&g->lock));
 
-	TAILQ_FOREACH(host, &nlm_hosts, nh_link) {
-		if (0 == strcmp(host->nh_name, name) &&
-		    0 == strcmp(host->nh_netid, netid) &&
-		    host->nh_addr.len == addr->len &&
-		    0 == memcmp(host->nh_addr.buf,
-		    addr->buf, addr->len)) {
-			host->nh_refs++;
-			break;
+	key.nh_netid = (char *)netid;
+	key.nh_addr.buf = naddr->buf;
+	key.nh_addr.len = naddr->len;
+	key.nh_addr.maxlen = naddr->maxlen;
+
+	hostp = avl_find(&g->nlm_hosts_tree, &key, &pos);
+
+	if (hostp != NULL) {
+		/*
+		 * Host is inuse now. Remove it from idle
+		 * hosts list if needed.
+		 */
+		if (hostp->nh_flags & NLM_NH_INIDLE) {
+			TAILQ_REMOVE(&g->nlm_idle_hosts, hostp, nh_link);
+			hostp->nh_flags &= ~NLM_NH_INIDLE;
 		}
+
+		hostp->nh_refs++;
 	}
-	return (host);
+	if (wherep != NULL)
+		*wherep = pos;
+
+	return (hostp);
+}
+
+/*
+ * Find NLM host for the given name and address.
+ */
+struct nlm_host *
+nlm_host_find(struct nlm_globals *g, const char *netid,
+    struct netbuf *addr)
+{
+	struct nlm_host *hostp = NULL;
+
+	mutex_enter(&g->lock);
+	if (g->run_status != NLM_ST_UP)
+		goto out;
+
+	hostp = nlm_host_find_locked(g, netid, addr, NULL);
+
+out:
+	mutex_exit(&g->lock);
+	return (hostp);
 }
 
 
@@ -793,44 +1577,63 @@ nlm_host_find_locked(char *name, const char *netid, struct netbuf *addr)
  * are different, allocate a new host (new sysid).
  */
 struct nlm_host *
-nlm_host_findcreate(char *name, const char *netid, struct netbuf *addr)
+nlm_host_findcreate(struct nlm_globals *g, char *name,
+    const char *netid, struct netbuf *addr)
 {
-	struct nlm_host *host, *newhost;
+	int err;
+	struct nlm_host *host, *newhost = NULL;
+	struct knetconfig knc;
+	avl_index_t where;
 
-	mutex_enter(&nlm_global_lock);
-	host = nlm_host_find_locked(name, netid, addr);
-	mutex_exit(&nlm_global_lock);
+	mutex_enter(&g->lock);
+	if (g->run_status != NLM_ST_UP) {
+		mutex_exit(&g->lock);
+		return (NULL);
+	}
+
+	host = nlm_host_find_locked(g, netid, addr, NULL);
+	mutex_exit(&g->lock);
 	if (host != NULL)
-		goto done;
+		return (host);
 
+	err = nlm_knc_from_netid(netid, &knc);
+	if (err != 0)
+		return (NULL);
 	/*
 	 * Do allocations (etc.) outside of mutex,
 	 * and then check again before inserting.
 	 */
-	newhost = nlm_create_host(name, netid, addr);
+	newhost = nlm_host_create(name, netid, &knc, addr);
+	newhost->nh_sysid = nlm_sysid_alloc();
+	if (newhost->nh_sysid == LM_NOSYSID)
+		goto out;
 
-	mutex_enter(&nlm_global_lock);
-	host = nlm_host_find_locked(name, netid, addr);
+	mutex_enter(&g->lock);
+	host = nlm_host_find_locked(g, netid, addr, &where);
 	if (host == NULL) {
-		newhost->nh_sysid = nlm_next_sysid++;
-		TAILQ_INSERT_TAIL(&nlm_hosts, newhost, nh_link);
-	}
-	mutex_exit(&nlm_global_lock);
-
-	if (host != NULL) {
-		nlm_host_destroy(newhost);
-		newhost = NULL;
-	} else {
-		/* We inserted */
 		host = newhost;
+		newhost = NULL;
+
+		/*
+		 * Insert host to the hosts AVL tree that is
+		 * used to lookup by <netid, address> pair.
+		 */
+		avl_insert(&g->nlm_hosts_tree, host, where);
+
+		/*
+		 * Insert host ot the hosts hash table that is
+		 * used to lookup host by sysid.
+		 */
+		VERIFY(mod_hash_insert(g->nlm_hosts_hash,
+		    (mod_hash_key_t)(uintptr_t)host->nh_sysid,
+		    (mod_hash_val_t)host) == 0);
 	}
 
-	NLM_DEBUG(1, "NLM: new host %s (sysid %d)\n",
-	    host->nh_name, host->nh_sysid);
+	mutex_exit(&g->lock);
 
-done:
-	host->nh_idle_timeout = ddi_get_lbolt() +
-	    SEC_TO_TICK(NLM_IDLE_TIMEOUT);
+out:
+	if (newhost != NULL)
+		nlm_host_destroy(newhost);
 
 	return (host);
 }
@@ -841,44 +1644,76 @@ done:
  * else return NULL.
  */
 struct nlm_host *
-nlm_host_find_by_sysid(int sysid)
+nlm_host_find_by_sysid(struct nlm_globals *g, sysid_t sysid)
 {
-	struct nlm_host *host;
+	struct nlm_host *hostp = NULL;
 
-	mutex_enter(&nlm_global_lock);
+	mutex_enter(&g->lock);
+	if (g->run_status != NLM_ST_UP)
+		goto out;
 
-	TAILQ_FOREACH(host, &nlm_hosts, nh_link) {
-		if (host->nh_sysid == sysid) {
-			atomic_inc_uint(&host->nh_refs);
-			break;
-		}
+	(void) mod_hash_find(g->nlm_hosts_hash,
+	    (mod_hash_key_t)(uintptr_t)sysid,
+	    (mod_hash_val_t)&hostp);
+
+	if (hostp == NULL)
+		goto out;
+
+	/*
+	 * Host is inuse now. Remove it
+	 * from idle hosts list if needed.
+	 */
+	if (hostp->nh_flags & NLM_NH_INIDLE) {
+		TAILQ_REMOVE(&g->nlm_idle_hosts, hostp, nh_link);
+		hostp->nh_flags &= ~NLM_NH_INIDLE;
 	}
 
-	mutex_exit(&nlm_global_lock);
+	hostp->nh_refs++;
 
-	return (host);
+out:
+	mutex_exit(&g->lock);
+	return (hostp);
 }
 
 /*
- * Release a reference to some host.  If it has no references
- * arrange for its destruction ...eventually.
+ * Release the given host.
+ * I.e. drop a reference that was taken earlier by one of
+ * the following functions: nlm_host_findcreate(), nlm_host_find(),
+ * nlm_host_find_by_sysid().
  *
- * XXX: This needs work.  We want these to stay in the list for
- * up to NLM_IDLE_TIMEOUT so they can be found and reused by the
- * same host during that time.  After the idle time expires,
- * hosts should be removed (and tell statd to stop monitoring).
+ * When the very last reference is dropped, host is moved to
+ * so-called "idle state". All hosts that are in idle state
+ * have an idle timeout. If timeout is expired, GC thread
+ * checks whether hosts have any locks and if they heven't
+ * any, it removes them.
+ * NOTE: only unused hosts can be in idle state.
  */
 void
-nlm_host_release(struct nlm_host *host)
+nlm_host_release(struct nlm_globals *g, struct nlm_host *hostp)
 {
+	if (hostp == NULL)
+		return;
 
-	if (0 == atomic_dec_uint_nv(&host->nh_refs)) {
-		/* Start idle timer */
-		host->nh_idle_timeout = ddi_get_lbolt() +
-		    SEC_TO_TICK(NLM_IDLE_TIMEOUT);
+	mutex_enter(&g->lock);
+	ASSERT(hostp->nh_refs > 0);
+
+	hostp->nh_refs--;
+	if (hostp->nh_refs != 0) {
+		mutex_exit(&g->lock);
+		return;
 	}
 
-	nlm_check_idle();	/* XXX */
+	/*
+	 * The very last reference to the host was dropped,
+	 * thus host is unused now. Set its idle timeout
+	 * and move it to the idle hosts LRU list.
+	 */
+	hostp->nh_idle_timeout = ddi_get_lbolt() +
+	    SEC_TO_TICK(g->cn_idle_tmo);
+
+	TAILQ_INSERT_TAIL(&g->nlm_idle_hosts, hostp, nh_link);
+	hostp->nh_flags |= NLM_NH_INIDLE;
+	mutex_exit(&g->lock);
 }
 
 /*
@@ -886,39 +1721,20 @@ nlm_host_release(struct nlm_host *host)
  * due to idleness (no locks held for a while).
  */
 void
-nlm_host_unmonitor(struct nlm_host *host)
+nlm_host_unmonitor(struct nlm_globals *g, struct nlm_host *host)
 {
-	mon_id args;
-	sm_stat res;
 	enum clnt_stat stat;
 
-	NLM_DEBUG(1, "NLM: unmonitoring %s (sysid %d)\n",
-	    host->nh_name, host->nh_sysid);
+	VERIFY(host->nh_refs == 0);
+	if (!(host->nh_flags & NLM_NH_MONITORED))
+		return;
 
-	/*
-	 * We put our assigned system ID value in the priv field to
-	 * make it simpler to find the host if we are notified of a
-	 * host restart.
-	 */
-	args.mon_name = host->nh_name;
-	args.my_id.my_name = uts_nodename();
-	args.my_id.my_prog = NLM_PROG;
-	args.my_id.my_vers = NLM_SM;
-	args.my_id.my_proc = NLM_SM_NOTIFY1;
-
-	/* Call SM_UNMON */
-	stat = sm_unmon_1(&args, &res, nlm_nsm);
+	host->nh_flags &= ~NLM_NH_MONITORED;
+	stat = nlm_nsm_unmon(&g->nlm_nsm, host->nh_name);
 	if (stat != RPC_SUCCESS) {
-		struct rpc_err err;
-		CLNT_GETERR(nlm_nsm, &err);
-		NLM_ERR("NLM: Failed to contact statd, "
-		    "stat=%d error=%d\n",
-		    stat, err.re_errno);
+		NLM_WARN("NLM: Failed to contact statd, stat=%d\n", stat);
 		return;
 	}
-
-	/* XXX: save res.state ? */
-	host->nh_monstate = NLM_UNMONITORED;
 }
 
 /*
@@ -928,535 +1744,924 @@ nlm_host_unmonitor(struct nlm_host *host)
  * which is handled in nlm_do_notify1().
  */
 void
-nlm_host_monitor(struct nlm_host *host, int state)
+nlm_host_monitor(struct nlm_globals *g, struct nlm_host *host, int state)
 {
-	struct mon args;
-	sm_stat_res res;
 	enum clnt_stat stat;
 
-	if (state && !host->nh_state) {
+	if (state != 0 && host->nh_state == 0) {
 		/*
 		 * This is the first time we have seen an NSM state
-		 * value for this host. We record it here to help
+		 * Value for this host. We record it here to help
 		 * detect host reboots.
 		 */
 		host->nh_state = state;
-		NLM_DEBUG(1, "NLM: host %s (sysid %d) has NSM state %d\n",
-		    host->nh_name, host->nh_sysid, state);
 	}
 
 	mutex_enter(&host->nh_lock);
-	if (host->nh_monstate != NLM_UNMONITORED) {
+	if (host->nh_flags & NLM_NH_MONITORED) {
 		mutex_exit(&host->nh_lock);
 		return;
 	}
-	host->nh_monstate = NLM_MONITORED;
-	mutex_exit(&host->nh_lock);
 
-	NLM_DEBUG(1, "NLM: monitoring %s (sysid %d)\n",
-	    host->nh_name, host->nh_sysid);
+	host->nh_flags |= NLM_NH_MONITORED;
+	mutex_exit(&host->nh_lock);
 
 	/*
 	 * Tell statd how to call us with status updates for
-	 * this host.  Updates arrive via nlm_do_notify1().
+	 * this host. Updates arrive via nlm_do_notify1().
 	 *
 	 * We put our assigned system ID value in the priv field to
 	 * make it simpler to find the host if we are notified of a
 	 * host restart.
 	 */
-	bzero(&args, sizeof (args));
-	args.mon_id.mon_name = host->nh_name;
-	args.mon_id.my_id.my_name = uts_nodename();
-	args.mon_id.my_id.my_prog = NLM_PROG;
-	args.mon_id.my_id.my_vers = NLM_SM;
-	args.mon_id.my_id.my_proc = NLM_SM_NOTIFY1;
-	bcopy(&host->nh_sysid, args.priv, sizeof (host->nh_sysid));
-
-	/* Call SM_MON */
-	stat = sm_mon_1(&args, &res, nlm_nsm);
+	stat = nlm_nsm_mon(&g->nlm_nsm, host->nh_name, host->nh_sysid);
 	if (stat != RPC_SUCCESS) {
-		NLM_ERR("Failed to contact local NSM - rpc error %d\n", stat);
+		NLM_WARN("Failed to contact local NSM, stat=%d\n", stat);
+		mutex_enter(&g->lock);
+		host->nh_flags &= ~NLM_NH_MONITORED;
+		mutex_exit(&g->lock);
+
 		return;
 	}
-	if (res.res_stat == stat_fail) {
-		NLM_ERR("Local NSM refuses to monitor %s\n",
-		    host->nh_name);
-		mutex_enter(&host->nh_lock);
-		host->nh_monstate = NLM_MONITOR_FAILED;
-		mutex_exit(&host->nh_lock);
-		return;
-	}
-
-	host->nh_monstate = NLM_MONITORED;
-}
-
-/*
- * XXX porting work still todo XXX
-
-The BSD kRPC service is apparently single-threaded,
-or so it says some places in this code.  We're full MT!
-
-I'm not sure we can share client handles (and cache) the way this
-function currently does.  The one thing this _could_ cache is the
-address we get from the rpcbind_getaddr (see nlm_get_rpc).  That's
-the only thing that's a little expensive to get, due to OtW trips.
-Further, there's just one of these per "host" object (not two).
-
-XXX: Do we need to give each calling thread it's own RPC handle?
-[ Actually, it looks like maybe RPC client handles are MT safe. ]
-Or can the RPC client handles be used by multiple threads?
-If not, we'll need to let each thread have its own RPC client.
-(They're just a network endpoint and some memory.)
-
-The algorithm for using such a cached rpcbind result should be:
-Do the clnt_tli_kcreate, try the RPC call; if the call fails
-with one of the errors suggesting "wrong port", then try the
-rpcbind call (just once) and retry the call.  Minor possible
-improvements to this algorithm would be to do a call to the
-NULLPROC when using a cached bind addr that has not been used
-in a while.  (server might change the port)
-
-With that done, CLNT_RELEASE (not yet implemented) can
-change to CLNT_DESTROY.
-
- * Return an RPC client handle that can be used to talk to the NLM
- * running on the given host.
- */
-CLIENT *
-nlm_host_get_rpc(struct nlm_host *host, int vers, bool_t isserver)
-{
-	struct nlm_rpc *rpc;
-	CLIENT *client;
-	clock_t time_uptime;
-
-	mutex_enter(&host->nh_lock);
-
-	if (isserver) {
-		/*
-		 * Some SVC function that needs to callback,
-		 * i.e. for reply to a _msg_ call, or for a
-		 * granted lock callback.
-		 */
-		rpc = &host->nh_srvrpc;
-	} else {
-		rpc = &host->nh_clntrpc;
-	}
-
-	/*
-	 * We can't hold onto RPC handles for too long - the async
-	 * call/reply protocol used by some NLM clients makes it hard
-	 * to tell when they change port numbers (e.g. after a
-	 * reboot). Note that if a client reboots while it isn't
-	 * holding any locks, it won't bother to notify us. We
-	 * expire the RPC handles after two minutes.
-	 */
-	time_uptime = ddi_get_lbolt();
-	if (rpc->nr_client && time_uptime > rpc->nr_create_time + 2*60) {
-		client = rpc->nr_client;
-		rpc->nr_client = NULL;
-		mutex_exit(&host->nh_lock);
-		CLNT_RELEASE(client);
-		mutex_enter(&host->nh_lock);
-	}
-
-	if (!rpc->nr_client) {
-		mutex_exit(&host->nh_lock);
-		client = nlm_get_rpc(host->nh_netid, &host->nh_addr,
-		    NLM_PROG, vers);
-		mutex_enter(&host->nh_lock);
-
-		if (client) {
-			if (rpc->nr_client) {
-				mutex_exit(&host->nh_lock);
-				CLNT_DESTROY(client);
-				mutex_enter(&host->nh_lock);
-			} else {
-				rpc->nr_client = client;
-				rpc->nr_create_time = time_uptime;
-			}
-		}
-	}
-
-	client = rpc->nr_client;
-	if (client)
-		CLNT_ACQUIRE(client);
-	mutex_exit(&host->nh_lock);
-
-	return (client);
-
 }
 
 int
-nlm_host_get_sysid(struct nlm_host *host)
+nlm_host_get_sysid(struct nlm_host *hostp)
 {
-
-	return (host->nh_sysid);
+	return (hostp->nh_sysid);
 }
 
 int
-nlm_host_get_state(struct nlm_host *host)
+nlm_host_get_state(struct nlm_host *hostp)
 {
 
-	return (host->nh_state);
+	return (hostp->nh_state);
 }
 
 /*
- * Our local client-side code calls this to block on a
- * remote lock.  (See nlm_call_lock).
+ * NLM client/server sleeping locks
  */
-void *
-nlm_register_wait_lock(
+
+/*
+ * Register client side sleeping lock.
+ *
+ * Our client code calls this to keep information
+ * about sleeping lock somewhere. When it receives
+ * grant callback from server or when it just
+ * needs to remove all sleeping locks from vnode,
+ * it uses this information for remove/apply lock
+ * properly.
+ */
+struct nlm_slock *
+nlm_slock_register(
+	struct nlm_globals *g,
 	struct nlm_host *host,
 	struct nlm4_lock *lock,
 	struct vnode *vp)
 {
-	struct nlm_owner_handle *oh;
-	struct nlm_waiting_lock *nw;
+	struct nlm_slock *nslp;
 
-	ASSERT(lock->oh.n_len == sizeof (*oh));
-	oh = (void *) lock->oh.n_bytes;
+	nslp = kmem_zalloc(sizeof (*nslp), KM_SLEEP);
+	cv_init(&nslp->nsl_cond, NULL, CV_DEFAULT, NULL);
+	nslp->nsl_lock = *lock;
+	nlm_copy_netobj(&nslp->nsl_fh, &nslp->nsl_lock.fh);
+	nslp->nsl_state = NLM_SL_BLOCKED;
+	nslp->nsl_host = host;
+	nslp->nsl_vp = vp;
 
-	nw = kmem_zalloc(sizeof (*nw), KM_SLEEP);
-	cv_init(&nw->nw_cond, NULL, CV_DEFAULT, NULL);
-	nw->nw_lock = *lock;
-	nlm_copy_netobj(&nw->nw_fh, &nw->nw_lock.fh);
-	nw->nw_state = NLM_WS_BLOCKED;
-	nw->nw_sysid = oh->oh_sysid;
-	nw->nw_host = host;	/* no hold - caller has it */
-	nw->nw_vp = vp;
+	mutex_enter(&g->lock);
+	TAILQ_INSERT_TAIL(&g->nlm_slocks, nslp, nsl_link);
+	mutex_exit(&g->lock);
 
-	mutex_enter(&host->nh_lock);
-	TAILQ_INSERT_TAIL(&host->nh_waiting, nw, nw_link);
-	mutex_exit(&host->nh_lock);
-
-	return (nw);
+	return (nslp);
 }
 
 /*
- * Remove this lock from the wait list.
+ * Remove this lock from the wait list and destroy it.
  */
 void
-nlm_deregister_wait_lock(struct nlm_host *host, void *handle)
+nlm_slock_unregister(struct nlm_globals *g, struct nlm_slock *nslp)
 {
-	struct nlm_waiting_lock *nw = handle;
+	mutex_enter(&g->lock);
+	TAILQ_REMOVE(&g->nlm_slocks, nslp, nsl_link);
+	mutex_exit(&g->lock);
 
-	mutex_enter(&host->nh_lock);
-	TAILQ_REMOVE(&host->nh_waiting, nw, nw_link);
-	mutex_exit(&host->nh_lock);
-
-	kmem_free(nw->nw_fh.n_bytes, nw->nw_fh.n_len);
-	cv_destroy(&nw->nw_cond);
-	kmem_free(nw, sizeof (*nw));
+	kmem_free(nslp->nsl_fh.n_bytes, nslp->nsl_fh.n_len);
+	cv_destroy(&nslp->nsl_cond);
+	kmem_free(nslp, sizeof (*nslp));
 }
 
 /*
- * Wait for a lock, then remove from the wait list.
+ * Wait for a granted callback or cancellation event
+ * for a sleeping lock.
+ *
+ * If a signal interrupted the wait or if the lock
+ * was cancelled, return EINTR - the caller must arrange to send
+ * a cancellation to the server.
+ *
+ * If timeout occurred, return ETIMEDOUT - the caller must
+ * resend the lock request to the server.
+ *
+ * On success return 0.
  */
 int
-nlm_wait_lock(void *handle, int timo)
+nlm_slock_wait(struct nlm_globals *g,
+    struct nlm_slock *nslp, uint_t timeo_secs)
 {
-	struct nlm_waiting_lock *nw = handle;
-	struct nlm_host *host = nw->nw_host;
-	clock_t when;
-	int error, rc;
+	clock_t timeo_ticks;
+	int cv_res, error;
 
 	/*
 	 * If the granted message arrived before we got here,
 	 * nw->nw_state will be GRANTED - in that case, don't sleep.
 	 */
-	mutex_enter(&host->nh_lock);
-	error = 0;
-	if (nw->nw_state == NLM_WS_BLOCKED) {
-		when = ddi_get_lbolt() + SEC_TO_TICK(timo);
-		rc = cv_timedwait_sig(&nw->nw_cond, &host->nh_lock, when);
+	cv_res = 1;
+	timeo_ticks = ddi_get_lbolt() + SEC_TO_TICK(timeo_secs);
+
+	mutex_enter(&g->lock);
+	if (nslp->nsl_state == NLM_SL_BLOCKED) {
+		cv_res = cv_timedwait_sig(&nslp->nsl_cond,
+		    &g->lock, timeo_ticks);
 	}
-	TAILQ_REMOVE(&host->nh_waiting, nw, nw_link);
-	if (rc <= 0) {
-		/* Timeout or interrupt. */
-		error = (rc == 0) ? EINTR : ETIME;
+
+	/*
+	 * No matter why we wake up, if the lock was
+	 * cancelled, let the function caller to know
+	 * about it by returning EINTR.
+	 */
+	if (nslp->nsl_state == NLM_SL_CANCELLED) {
+		error = EINTR;
+		goto out;
+	}
+
+	if (cv_res <= 0) {
+		/* We was woken up either by timeout or interrupt */
+		error = (cv_res < 0) ? ETIMEDOUT : EINTR;
+
 		/*
 		 * The granted message may arrive after the
 		 * interrupt/timeout but before we manage to lock the
-		 * mutex. Detect this by examining nw_lock.
+		 * mutex. Detect this by examining nslp.
 		 */
-		if (nw->nw_state == NLM_WS_GRANTED)
+		if (nslp->nsl_state == NLM_SL_GRANTED)
 			error = 0;
-	} else {
-		/* Got cv_signal. */
+	} else { /* awaken via cv_signal or didn't block */
 		error = 0;
-		/*
-		 * If nlm_cancel_wait is called, then error will be
-		 * zero but nw_state will be NLM_WS_CANCELLED.
-		 * We translate this into EINTR.
-		 */
-		if (nw->nw_state == NLM_WS_CANCELLED)
-			error = EINTR;
+		VERIFY(nslp->nsl_state == NLM_SL_GRANTED);
 	}
-	mutex_exit(&host->nh_lock);
 
-	kmem_free(nw, sizeof (*nw));
-
+out:
+	mutex_exit(&g->lock);
 	return (error);
 }
 
-void
-nlm_cancel_wait_locks(struct nlm_host *host)
+/*
+ * Mark client side sleeping lock as granted
+ * and wake up a process blocked on the lock.
+ * Called from server side NLM_GRANT handler.
+ *
+ * If sleeping lock is found return 0, otherwise
+ * return ENOENT.
+ */
+int
+nlm_slock_grant(struct nlm_globals *g,
+    struct nlm_host *hostp, struct nlm4_lock *alock)
 {
-	struct nlm_waiting_lock *nw;
+	struct nlm_slock *nslp;
+	int error = ENOENT;
 
-	ASSERT(MUTEX_HELD(&host->nh_lock));
+	mutex_enter(&g->lock);
+	TAILQ_FOREACH(nslp, &g->nlm_slocks, nsl_link) {
+		if ((nslp->nsl_state != NLM_SL_BLOCKED) ||
+		    (nslp->nsl_host != hostp))
+			continue;
 
-	TAILQ_FOREACH(nw, &host->nh_waiting, nw_link) {
-		nw->nw_state = NLM_WS_CANCELLED;
-		cv_broadcast(&nw->nw_cond);
+		if (alock->svid		== nslp->nsl_lock.svid &&
+		    alock->l_offset	== nslp->nsl_lock.l_offset &&
+		    alock->l_len	== nslp->nsl_lock.l_len &&
+		    alock->fh.n_len	== nslp->nsl_lock.fh.n_len &&
+		    bcmp(alock->fh.n_bytes, nslp->nsl_lock.fh.n_bytes,
+		    nslp->nsl_lock.fh.n_len) == 0) {
+			nslp->nsl_state = NLM_SL_GRANTED;
+			cv_broadcast(&nslp->nsl_cond);
+			error = 0;
+			break;
+		}
+	}
+
+	mutex_exit(&g->lock);
+	return (error);
+}
+
+/*
+ * Register sleeping lock request corresponding to
+ * flp on the given vhold object.
+ * On success function returns 0, otherwise (if
+ * lock request with the same flp is already
+ * registered) function returns EEXIST.
+ */
+int
+nlm_slreq_register(struct nlm_host *hostp, struct nlm_vhold *nvp,
+	struct flock64 *flp)
+{
+	struct nlm_slreq *slr, *new_slr = NULL;
+	int ret = EEXIST;
+
+	mutex_enter(&hostp->nh_lock);
+	slr = nlm_slreq_find_locked(hostp, nvp, flp);
+	if (slr != NULL)
+		goto out;
+
+	mutex_exit(&hostp->nh_lock);
+	new_slr = kmem_zalloc(sizeof (*slr), KM_SLEEP);
+	bcopy(flp, &new_slr->nsr_fl, sizeof (*flp));
+
+	mutex_enter(&hostp->nh_lock);
+	slr = nlm_slreq_find_locked(hostp, nvp, flp);
+	if (slr == NULL) {
+		slr = new_slr;
+		new_slr = NULL;
+		ret = 0;
+
+		TAILQ_INSERT_TAIL(&nvp->nv_slreqs, slr, nsr_link);
+	}
+
+out:
+	mutex_exit(&hostp->nh_lock);
+	if (new_slr != NULL)
+		kmem_free(new_slr, sizeof (*new_slr));
+
+	return (ret);
+}
+
+/*
+ * Unregister sleeping lock request corresponding
+ * to flp from the given vhold object.
+ * On success function returns 0, otherwise (if
+ * lock request corresponding to flp isn't found
+ * on the given vhold) function returns ENOENT.
+ */
+int
+nlm_slreq_unregister(struct nlm_host *hostp, struct nlm_vhold *nvp,
+	struct flock64 *flp)
+{
+	struct nlm_slreq *slr;
+
+	mutex_enter(&hostp->nh_lock);
+	slr = nlm_slreq_find_locked(hostp, nvp, flp);
+	if (slr == NULL) {
+		mutex_exit(&hostp->nh_lock);
+		return (ENOENT);
+	}
+
+	TAILQ_REMOVE(&nvp->nv_slreqs, slr, nsr_link);
+	mutex_exit(&hostp->nh_lock);
+
+	kmem_free(slr, sizeof (*slr));
+	return (0);
+}
+
+/*
+ * Find sleeping lock request on the given vhold object by flp.
+ */
+struct nlm_slreq *
+nlm_slreq_find_locked(struct nlm_host *hostp, struct nlm_vhold *nvp,
+    struct flock64 *flp)
+{
+	struct nlm_slreq *slr = NULL;
+
+	ASSERT(MUTEX_HELD(&hostp->nh_lock));
+	TAILQ_FOREACH(slr, &nvp->nv_slreqs, nsr_link) {
+		if (slr->nsr_fl.l_start		== flp->l_start	&&
+		    slr->nsr_fl.l_len		== flp->l_len	&&
+		    slr->nsr_fl.l_pid		== flp->l_pid	&&
+		    slr->nsr_fl.l_type		== flp->l_type)
+			break;
+	}
+
+	return (slr);
+}
+
+/*
+ * NLM tracks active share reservations made on the client side.
+ * It needs to have a track of share reservations for two purposes
+ * 1) to determine if nlm_host is busy (if it has active locks and/or
+ *    share reservations, it is)
+ * 2) to recover active share reservations when NLM server reports
+ *    that it has rebooted.
+ *
+ * Unfortunately Illumos local share reservations manager (see os/share.c)
+ * doesn't have an ability to lookup all reservations on the system
+ * by sysid (like local lock manager) or get all reservations by sysid.
+ * It tracks reservations per vnode and is able to get/looup them
+ * on particular vnode. It's not what NLM needs. Thus it has that ugly
+ * share reservations tracking scheme.
+ */
+
+void
+nlm_shres_track(struct nlm_host *hostp, vnode_t *vp, struct shrlock *shrp)
+{
+	struct nlm_shres *nsp, *nsp_new;
+
+	/*
+	 * NFS code must fill the s_owner, so that
+	 * s_own_len is never 0.
+	 */
+	ASSERT(shrp->s_own_len > 0);
+	nsp_new = nlm_shres_create_item(shrp, vp);
+
+	mutex_enter(&hostp->nh_lock);
+	for (nsp = hostp->nh_shrlist; nsp != NULL; nsp = nsp->ns_next)
+		if (nsp->ns_vp == vp && nlm_shres_equal(shrp, nsp->ns_shr))
+			break;
+
+	if (nsp != NULL) {
+		/*
+		 * Found a duplicate. Do nothing.
+		 */
+
+		goto out;
+	}
+
+	nsp = nsp_new;
+	nsp_new = NULL;
+	nsp->ns_next = hostp->nh_shrlist;
+	hostp->nh_shrlist = nsp;
+
+out:
+	mutex_exit(&hostp->nh_lock);
+	if (nsp_new != NULL)
+		nlm_shres_destroy_item(nsp_new);
+}
+
+void
+nlm_shres_untrack(struct nlm_host *hostp, vnode_t *vp, struct shrlock *shrp)
+{
+	struct nlm_shres *nsp, *nsp_prev = NULL;
+
+	mutex_enter(&hostp->nh_lock);
+	nsp = hostp->nh_shrlist;
+	while (nsp != NULL) {
+		if (nsp->ns_vp == vp && nlm_shres_equal(shrp, nsp->ns_shr)) {
+			struct nlm_shres *nsp_del;
+
+			nsp_del = nsp;
+			nsp = nsp->ns_next;
+			if (nsp_prev != NULL)
+				nsp_prev->ns_next = nsp;
+			else
+				hostp->nh_shrlist = nsp;
+
+			nlm_shres_destroy_item(nsp_del);
+			continue;
+		}
+
+		nsp_prev = nsp;
+		nsp = nsp->ns_next;
+	}
+
+	mutex_exit(&hostp->nh_lock);
+}
+
+/*
+ * Get a _copy_ of the list of all active share reservations
+ * made by the given host.
+ * NOTE: the list function returns _must_ be released using
+ *       nlm_free_shrlist().
+ */
+struct nlm_shres *
+nlm_get_active_shres(struct nlm_host *hostp)
+{
+	struct nlm_shres *nsp, *nslist = NULL;
+
+	mutex_enter(&hostp->nh_lock);
+	for (nsp = hostp->nh_shrlist; nsp != NULL; nsp = nsp->ns_next) {
+		struct nlm_shres *nsp_new;
+
+		nsp_new = nlm_shres_create_item(nsp->ns_shr, nsp->ns_vp);
+		nsp_new->ns_next = nslist;
+		nslist = nsp_new;
+	}
+
+	mutex_exit(&hostp->nh_lock);
+	return (nslist);
+}
+
+/*
+ * Free memory allocated for the active share reservations
+ * list created by nlm_get_active_shres() function.
+ */
+void
+nlm_free_shrlist(struct nlm_shres *nslist)
+{
+	struct nlm_shres *nsp;
+
+	while (nslist != NULL) {
+		nsp =  nslist;
+		nslist = nslist->ns_next;
+
+		nlm_shres_destroy_item(nsp);
 	}
 }
 
+static bool_t
+nlm_shres_equal(struct shrlock *shrp1, struct shrlock *shrp2)
+{
+	if (shrp1->s_sysid	== shrp2->s_sysid	&&
+	    shrp1->s_pid	== shrp2->s_pid		&&
+	    shrp1->s_own_len	== shrp2->s_own_len	&&
+	    bcmp(shrp1->s_owner, shrp2->s_owner,
+	    shrp1->s_own_len) == 0)
+		return (TRUE);
 
-/* ******************************************************************* */
+	return (FALSE);
+}
 
-/*
- * Syscall interface with userland.
- * Bind RPC service endpoints.
- *
- * Local-only transports get a different set of programs than
- * network transports.  The local transport is used by statd
- * to call us back with host monitoring events using NLM_SM
- * (version==2) but for safety, don't let remote callers use
- * any calls in that program.
- */
+static struct nlm_shres *
+nlm_shres_create_item(struct shrlock *shrp, vnode_t *vp)
+{
+	struct nlm_shres *nsp;
 
-/*
- * RPC service registrations for LOOPBACK,
- * allowed to call the real nlm_prog_2.
- * None of the others are used locally.
- */
-static SVC_CALLOUT nlm_svcs_lo[] = {
-	{ NLM_PROG, 2, 2, nlm_prog_2 }, /* NLM_SM */
-};
-static SVC_CALLOUT_TABLE nlm_sct_lo = {
-	sizeof (nlm_svcs_lo) / sizeof (nlm_svcs_lo[0]),
-	FALSE,	/* dynamically allocated? */
-	nlm_svcs_lo	/* table above */
-};
+	nsp = kmem_alloc(sizeof (*nsp), KM_SLEEP);
+	nsp->ns_shr = kmem_alloc(sizeof (*shrp), KM_SLEEP);
+	bcopy(shrp, nsp->ns_shr, sizeof (*shrp));
+	nsp->ns_shr->s_owner = kmem_alloc(shrp->s_own_len, KM_SLEEP);
+	bcopy(shrp->s_owner, nsp->ns_shr->s_owner, shrp->s_own_len);
+	nsp->ns_vp = vp;
 
-/*
- * RPC service registration for inet transports.
- * Note that the version 2 (NLM_SM) entries are
- * all NULL (noproc) in these dispatchers.
- */
-static SVC_CALLOUT nlm_svcs_in[] = {
-	{ NLM_PROG, 4, 4, nlm_prog_4 },	/* NLM4_VERS */
-	{ NLM_PROG, 1, 3, nlm_prog_3 },	/* NLM_VERS - NLM_VERSX */
-};
-static SVC_CALLOUT_TABLE nlm_sct_in = {
-	sizeof (nlm_svcs_in) / sizeof (nlm_svcs_in[0]),
-	FALSE,	/* dynamically allocated? */
-	nlm_svcs_in	/* table above */
-};
+	return (nsp);
+}
 
-static void nlm_xprtclose(const SVCMASTERXPRT *xprt);
+static void
+nlm_shres_destroy_item(struct nlm_shres *nsp)
+{
+	kmem_free(nsp->ns_shr->s_owner,
+	    nsp->ns_shr->s_own_len);
+	kmem_free(nsp->ns_shr, sizeof (struct shrlock));
+	kmem_free(nsp, sizeof (*nsp));
+}
 
 /*
  * Called by klmmod.c when lockd adds a network endpoint
  * on which we should begin RPC services.
  */
 int
-nlm_svc_add_ep(struct nlm_globals *g, struct file *fp,
-    char *netid, struct knetconfig *knc)
+nlm_svc_add_ep(struct file *fp, const char *netid, struct knetconfig *knc)
 {
-	int err;
-	SVC_CALLOUT_TABLE *sct;
 	SVCMASTERXPRT *xprt = NULL;
+	int error;
 
-	if (0 == strcmp(knc->knc_protofmly, NC_LOOPBACK))
-		sct = &nlm_sct_lo;
-	else
-		sct = &nlm_sct_in;
+	error = svc_tli_kcreate(fp, 0, (char *)netid, NULL, &xprt,
+	    &nlm_sct, NULL, NLM_SVCPOOL_ID, FALSE);
+	if (error != 0)
+		return (error);
 
-	err = svc_tli_kcreate(fp, 0, netid, NULL, &xprt,
-	    sct, nlm_xprtclose, NLM_SVCPOOL_ID, FALSE);
-
-	/*
-	 * Keep a list of transports, and with each, the
-	 * netconfig we used to create it.  This is used
-	 * both for detecting close of the last transport,
-	 * and to build outgoing transport handles when
-	 * RPC service code need to build a CLIENT handle
-	 * to call back to some host.  XXX - todo
-	 */
-	/* nlm_nc_add(XXX) */
-
-	return (err);
-}
-
-/*
- * Called by klmmod.c before lockd starts up service on the
- * first endpoint.  Note: run_status == NLM_ST_STARTING
- *
- * The first transport passed in by the user-level lockd is
- * the loopback we'll use to talk to the statd.  Check that
- * we get what we're expecting, and setup the RPC client
- * handle we'll used to talk to statd.
- */
-int
-nlm_svc_starting(struct nlm_globals *g,
-    const char *netid, struct knetconfig *knc)
-{
-	enum clnt_stat stat;
-	clock_t time_uptime;
-	char myaddr[SYS_NMLN + 2];
-	struct netbuf nb;
-
-	if (0 != strcmp(knc->knc_protofmly, NC_LOOPBACK)) {
-		NLM_ERR("NLM: starting, wrong protofmly");
-		return (EINVAL);
-	}
-
-	/*
-	 * Initialize the list of netconfigs.
-	 * Must do this before nlm_get_rpc().
-	 */
-	nlm_nc_clear(g);
-	nlm_nc_add(g, netid, knc);
-
-	/*
-	 * Get an RPC client handle for the local statd.
-	 *
-	 * Create the "self" host address, which is like
-	 * "nodename.service" where the service is empty,
-	 * and nodename is the zone's node name.
-	 */
-	nb.buf = myaddr;
-	nb.maxlen = sizeof (myaddr);
-	nb.len = snprintf(nb.buf, nb.maxlen, "%s.", uts_nodename());
-
-	nlm_nsm = nlm_get_rpc(netid, &nb, SM_PROG, SM_VERS);
-	if (nlm_nsm == NULL) {
-		NLM_ERR("NLM: internal error contacting NSM");
-		return (EIO);
-	}
-
-	/*
-	 * Inform statd that we're starting (or restarting)
-	 * with call SM_SIMU_CRASH.
-	 */
-	stat = sm_simu_crash_1(NULL, NULL, nlm_nsm);
-	if (stat != RPC_SUCCESS) {
-		struct rpc_err err;
-
-		CLNT_GETERR(nlm_nsm, &err);
-		NLM_ERR("NLM: unexpected error contacting NSM, "
-		    "stat=%d, errno=%d\n", stat, err.re_errno);
-		return (EIO);
-	}
-
-	time_uptime = ddi_get_lbolt();
-	g->grace_threshold = time_uptime +
-	    SEC_TO_TICK(g->grace_period);
-	g->next_idle_check = time_uptime +
-	    SEC_TO_TICK(NLM_IDLE_PERIOD);
-
+	nlm_knc_activate(knc);
 	return (0);
 }
 
 /*
- * Called by klmmod.c when lockd is going away.
- * Note: run_status == NLM_ST_STOPPING
- * XXX: figure out where to call this...
+ * Start NLM service.
+ */
+int
+nlm_svc_starting(struct nlm_globals *g, struct file *fp,
+    const char *netid, struct knetconfig *knc)
+{
+	int error;
+	enum clnt_stat stat;
+
+	VERIFY(g->run_status == NLM_ST_STARTING);
+	VERIFY(g->nlm_gc_thread == NULL);
+
+	error = nlm_nsm_init_local(&g->nlm_nsm);
+	if (error != 0) {
+		NLM_ERR("Failed to initialize NSM handler "
+		    "(error=%d)\n", error);
+		g->run_status = NLM_ST_DOWN;
+		return (error);
+	}
+
+	error = EIO;
+
+	/*
+	 * Create an NLM garbage collector thread that will
+	 * clean up stale vholds and hosts objects.
+	 */
+	g->nlm_gc_thread = zthread_create(NULL, 0, nlm_gc,
+	    g, 0, minclsyspri);
+
+	/*
+	 * Send SIMU_CRASH to local statd to report that
+	 * NLM started, so that statd can report other hosts
+	 * about NLM state change.
+	 */
+
+	stat = nlm_nsm_simu_crash(&g->nlm_nsm);
+	if (stat != RPC_SUCCESS) {
+		NLM_ERR("Failed to connect to local statd "
+		    "(rpcerr=%d)\n", stat);
+		goto shutdown_lm;
+	}
+
+	stat = nlm_nsm_stat(&g->nlm_nsm, &g->nsm_state);
+	if (stat != RPC_SUCCESS) {
+		NLM_ERR("Failed to get the status of local statd "
+		    "(rpcerr=%d)\n", stat);
+		goto shutdown_lm;
+	}
+
+	g->grace_threshold = ddi_get_lbolt() +
+	    SEC_TO_TICK(g->grace_period);
+
+	/* Register endpoint used for communications with local NLM */
+	error = nlm_svc_add_ep(fp, netid, knc);
+	if (error != 0)
+		goto shutdown_lm;
+
+	(void) svc_pool_control(NLM_SVCPOOL_ID,
+	    SVCPSET_SHUTDOWN_PROC, (void *)nlm_pool_shutdown);
+	g->run_status = NLM_ST_UP;
+	return (0);
+
+shutdown_lm:
+	mutex_enter(&g->lock);
+	g->run_status = NLM_ST_STOPPING;
+	mutex_exit(&g->lock);
+
+	nlm_svc_stopping(g);
+	return (error);
+}
+
+/*
+ * Called when the server pool is destroyed, so that
+ * all transports are closed and no any server threads
+ * exist.
+ *
+ * Just call lm_shutdown() to shut NLM down properly.
+ */
+static void
+nlm_pool_shutdown(void)
+{
+	(void) lm_shutdown();
+}
+
+/*
+ * Stop NLM service, cleanup all resources
+ * NLM owns at the moment.
+ *
+ * NOTE: NFS code can call NLM while it's
+ * stopping or even if it's shut down. Any attemp
+ * to lock file either on client or on the server
+ * will fail if NLM isn't in NLM_ST_UP state.
  */
 void
 nlm_svc_stopping(struct nlm_globals *g)
 {
-	struct nlm_host *host, *nhost;
+	ASSERT(g->run_status == NLM_ST_STOPPING);
+	mutex_enter(&g->lock);
 
 	/*
-	 * Trash all the existing state so that if the server
-	 * restarts, it gets a clean slate. This is complicated by the
-	 * possibility that there may be other threads trying to make
-	 * client locking requests.
-
-Set a flag to prevent creation of new host entries.
-Walk existing host entries marking them "dead".
-Wait for threads using them to leave...
-
-	 * First we fake a client reboot notification which will
-	 * cancel any pending async locks and purge remote lock state
-	 * from the local lock manager. We release the reference from
-	 * nlm_hosts to the host (which may remove it from the list
-	 * and free it). After this phase, the only entries in the
-	 * nlm_host list should be from other threads performing
-	 * client lock requests. We arrange to defer closing the
-	 * sockets until the last RPC client handle is released.
+	 * Ask NLM GC thread to exit and wait until it do dies.
 	 */
-	mutex_enter(&nlm_global_lock);
-	/* TAILQ_FOREACH_SAFE */
-	host = TAILQ_FIRST(&nlm_hosts);
-	while (host != NULL) {
-		nhost = TAILQ_NEXT(host, nh_link);
-		mutex_exit(&nlm_global_lock);
-		nlm_host_notify_server(host, 0);
-		nlm_cancel_wait_locks(host);
-		/* nlm_host_release(host)	* XXX wrong... */
-		mutex_enter(&nlm_global_lock);
-		host = nhost;
-	}
-	/* TAILQ_FOREACH_SAFE */
-	host = TAILQ_FIRST(&nlm_hosts);
-	while (host != NULL) {
-		nhost = TAILQ_NEXT(host, nh_link);
-		mutex_enter(&host->nh_lock);
+	cv_signal(&g->nlm_gc_sched_cv);
+	while (g->nlm_gc_thread != NULL)
+		cv_wait(&g->nlm_gc_finish_cv, &g->lock);
 
-#if 0 /* XXX */
-		if (host->nh_srvrpc.nr_client ||
-		    host->nh_clntrpc.nr_client) {
-			if (host->nh_addr.ss_family == AF_INET)
-				v4_used++;
-#ifdef INET6
-			if (host->nh_addr.ss_family == AF_INET6)
-				v6_used++;
-#endif
-			/*
-			 * Note that the rpc over udp code copes
-			 * correctly with the fact that a socket may
-			 * be used by many rpc handles.
-			 */
-			if (host->nh_srvrpc.nr_client)
-				CLNT_CONTROL(host->nh_srvrpc.nr_client,
-				    CLSET_FD_CLOSE, 0);
-			if (host->nh_clntrpc.nr_client)
-				CLNT_CONTROL(host->nh_clntrpc.nr_client,
-				    CLSET_FD_CLOSE, 0);
+	mutex_exit(&g->lock);
+
+	/*
+	 * Cleanup locks owned by NLM hosts.
+	 * NOTE: New hosts won't be created while
+	 * NLM is stopping.
+	 */
+	while (!avl_is_empty(&g->nlm_hosts_tree)) {
+		struct nlm_host *hostp;
+		int busy_hosts = 0;
+
+		/*
+		 * Iterate through all NLM hosts in the system
+		 * and drop the locks they own by force.
+		 */
+		hostp = avl_first(&g->nlm_hosts_tree);
+		while (hostp != NULL) {
+			/* Cleanup all client and server side locks */
+			nlm_client_cancel_all(g, hostp);
+			nlm_host_notify_server(hostp, 0);
+
+			mutex_enter(&hostp->nh_lock);
+			nlm_host_gc_vholds(hostp);
+			if (hostp->nh_refs > 0 || nlm_host_has_locks(hostp)) {
+				/*
+				 * Oh, it seems the host is still busy, let
+				 * it some time to release and go to the
+				 * next one.
+				 */
+
+				mutex_exit(&hostp->nh_lock);
+				hostp = AVL_NEXT(&g->nlm_hosts_tree, hostp);
+				busy_hosts++;
+				continue;
+			}
+
+			mutex_exit(&hostp->nh_lock);
+			hostp = AVL_NEXT(&g->nlm_hosts_tree, hostp);
 		}
-#endif	/* XXX */
 
-		mutex_exit(&host->nh_lock);
-		host = nhost;
+		/*
+		 * All hosts go to nlm_idle_hosts list after
+		 * all locks they own are cleaned up and last refereces
+		 * were dropped. Just destroy all hosts in nlm_idle_hosts
+		 * list, they can not be removed from there while we're
+		 * in stopping state.
+		 */
+		while ((hostp = TAILQ_FIRST(&g->nlm_idle_hosts)) != NULL) {
+			nlm_host_unregister(g, hostp);
+			nlm_host_destroy(hostp);
+		}
+
+		if (busy_hosts > 0) {
+			/*
+			 * There're some hosts that weren't cleaned
+			 * up. Probably they're in resource cleanup
+			 * process. Give them some time to do drop
+			 * references.
+			 */
+			delay(MSEC_TO_TICK(500));
+		}
 	}
-	mutex_exit(&nlm_global_lock);
 
-	AUTH_DESTROY(nlm_auth);
+	ASSERT(TAILQ_EMPTY(&g->nlm_slocks));
 
-#if 0 /* XXX */
-	if (!v4_used)
-		soclose(nlm_socket);
-	nlm_socket = NULL;
-	if (!v6_used)
-		soclose(nlm_socket6);
-	nlm_socket6 = NULL;
-#endif /* XXX */
+	nlm_nsm_fini(&g->nlm_nsm);
+	g->lockd_pid = 0;
+	g->run_status = NLM_ST_DOWN;
 }
 
 /*
- * Called by the RPC code when it's done with this transport.
+ * Returns TRUE if the given vnode has
+ * any active or sleeping locks.
  */
-static void nlm_xprtclose(const SVCMASTERXPRT *xprt)
+int
+nlm_vp_active(const vnode_t *vp)
+{
+	struct nlm_globals *g;
+	struct nlm_host *hostp;
+	struct nlm_vhold *nvp;
+	int active = 0;
+
+	g = zone_getspecific(nlm_zone_key, curzone);
+
+	/*
+	 * Server side NLM has locks on the given vnode
+	 * if there exist a vhold object that holds
+	 * the given vnode "vp" in one of NLM hosts.
+	 */
+	mutex_enter(&g->lock);
+	hostp = avl_first(&g->nlm_hosts_tree);
+	while (hostp != NULL) {
+		nvp = nlm_vhold_find_locked(hostp, vp);
+		if (nvp != NULL) {
+			active = 1;
+			break;
+		}
+
+		hostp = AVL_NEXT(&g->nlm_hosts_tree, hostp);
+	}
+
+	mutex_exit(&g->lock);
+	return (active);
+}
+
+/*
+ * Called right before NFS export is going to
+ * dissapear. The function finds all vnodes
+ * belonging to the given export and cleans
+ * all remote locks and share reservations
+ * on them.
+ */
+void
+nlm_unexport(struct exportinfo *exi)
+{
+	struct nlm_globals *g;
+	struct nlm_host *hostp;
+
+	g = zone_getspecific(nlm_zone_key, curzone);
+
+	mutex_enter(&g->lock);
+	hostp = avl_first(&g->nlm_hosts_tree);
+	while (hostp != NULL) {
+		struct nlm_vhold *nvp;
+		int sysid;
+
+		sysid = nlm_host_get_sysid(hostp);
+		mutex_enter(&hostp->nh_lock);
+		TAILQ_FOREACH(nvp, &hostp->nh_vholds_list, nv_link) {
+			vnode_t *vp;
+
+			nvp->nv_refcnt++;
+			mutex_exit(&hostp->nh_lock);
+
+			vp = nvp->nv_vp;
+
+			if (!EQFSID(&exi->exi_fsid, &vp->v_vfsp->vfs_fsid))
+				goto next_iter;
+
+			/*
+			 * Ok, it we found out that vnode vp is under
+			 * control by the exportinfo exi, now we need
+			 * to drop all locks from this vnode, let's
+			 * do it.
+			 */
+			nlm_vhold_clean(nvp, sysid);
+
+		next_iter:
+			mutex_enter(&hostp->nh_lock);
+			nvp->nv_refcnt--;
+		}
+
+		mutex_exit(&hostp->nh_lock);
+		hostp = AVL_NEXT(&g->nlm_hosts_tree, hostp);
+	}
+
+	mutex_exit(&g->lock);
+}
+
+/*
+ * Allocate new unique sysid.
+ * In case of failure (no available sysids)
+ * return LM_NOSYSID.
+ */
+sysid_t
+nlm_sysid_alloc(void)
+{
+	sysid_t ret_sysid = LM_NOSYSID;
+
+	rw_enter(&lm_lck, RW_WRITER);
+	if (nlm_sysid_nidx > LM_SYSID_MAX)
+		nlm_sysid_nidx = LM_SYSID;
+
+	if (!BT_TEST(nlm_sysid_bmap, nlm_sysid_nidx)) {
+		BT_SET(nlm_sysid_bmap, nlm_sysid_nidx);
+		ret_sysid = nlm_sysid_nidx++;
+	} else {
+		index_t id;
+
+		id = bt_availbit(nlm_sysid_bmap, NLM_BMAP_NITEMS);
+		if (id > 0) {
+			nlm_sysid_nidx = id + 1;
+			ret_sysid = id;
+			BT_SET(nlm_sysid_bmap, id);
+		}
+	}
+
+	rw_exit(&lm_lck);
+	return (ret_sysid);
+}
+
+void
+nlm_sysid_free(sysid_t sysid)
+{
+	ASSERT(sysid >= LM_SYSID && sysid <= LM_SYSID_MAX);
+
+	rw_enter(&lm_lck, RW_WRITER);
+	ASSERT(BT_TEST(nlm_sysid_bmap, sysid));
+	BT_CLEAR(nlm_sysid_bmap, sysid);
+	rw_exit(&lm_lck);
+}
+
+/*
+ * Return true if the request came from a local caller.
+ * By necessity, this "knows" the netid names invented
+ * in lm_svc() and nlm_netid_from_knetconfig().
+ */
+bool_t
+nlm_caller_is_local(SVCXPRT *transp)
 {
 	char *netid;
+	struct netbuf *rtaddr;
 
-	netid = svc_getnetid(xprt);
-	/* Destroy all hosts using this netid...  */
-	(void) netid;
+	netid = svc_getnetid(transp);
+	rtaddr = svc_getrpccaller(transp);
 
-	/* XXX - todo */
+	if (netid == NULL)
+		return (FALSE);
+
+	if (strcmp(netid, "ticlts") == 0 ||
+	    strcmp(netid, "ticotsord") == 0)
+		return (TRUE);
+
+	if (strcmp(netid, "tcp") == 0 || strcmp(netid, "udp") == 0) {
+		struct sockaddr_in *sin = (void *)rtaddr->buf;
+		if (sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK))
+			return (TRUE);
+	}
+	if (strcmp(netid, "tcp6") == 0 || strcmp(netid, "udp6") == 0) {
+		struct sockaddr_in6 *sin6 = (void *)rtaddr->buf;
+		if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr))
+			return (TRUE);
+	}
+
+	return (FALSE); /* unknown transport */
+}
+
+/*
+ * Get netid string correspondig to the
+ * given knetconfig.
+ */
+const char *
+nlm_knc_to_netid(struct knetconfig *knc)
+{
+	int i;
+	const char *netid = NULL;
+
+	rw_enter(&lm_lck, RW_READER);
+	for (i = 0; i < NLM_KNCS; i++) {
+		struct knetconfig *knc_iter;
+
+		knc_iter = &nlm_netconfigs[i].n_knc;
+		if (knc_iter->knc_semantics == knc->knc_semantics &&
+		    strcmp(knc_iter->knc_protofmly,
+		    knc->knc_protofmly) == 0) {
+			netid = nlm_netconfigs[i].n_netid;
+			break;
+		}
+	}
+
+	rw_exit(&lm_lck);
+	return (netid);
+}
+
+/*
+ * Get a knetconfig corresponding to the given netid.
+ * If there's no knetconfig for this netid, ENOENT
+ * is returned.
+ */
+int
+nlm_knc_from_netid(const char *netid, struct knetconfig *knc)
+{
+	int i, ret;
+
+	ret = ENOENT;
+	for (i = 0; i < NLM_KNCS; i++) {
+		struct nlm_knc *nknc;
+
+		nknc = &nlm_netconfigs[i];
+		if (strcmp(netid, nknc->n_netid) == 0 &&
+		    nknc->n_knc.knc_rdev != NODEV) {
+			*knc = nknc->n_knc;
+			ret = 0;
+			break;
+		}
+	}
+
+	return (ret);
+}
+
+void
+nlm_knc_activate(struct knetconfig *knc)
+{
+	int i;
+
+	rw_enter(&lm_lck, RW_WRITER);
+	for (i = 0; i < NLM_KNCS; i++) {
+		struct knetconfig *knc_iter;
+
+		knc_iter = &nlm_netconfigs[i].n_knc;
+		if (knc_iter->knc_rdev != NODEV)
+			continue;
+
+		if (knc_iter->knc_semantics == knc->knc_semantics &&
+		    strcmp(knc_iter->knc_protofmly,
+		    knc->knc_protofmly) == 0 &&
+		    strcmp(knc_iter->knc_proto, knc->knc_proto) == 0) {
+			knc_iter->knc_rdev = knc->knc_rdev;
+			break;
+		}
+	}
+
+	rw_exit(&lm_lck);
+}
+
+void
+nlm_cprsuspend(void)
+{
+	struct nlm_globals *g;
+
+	rw_enter(&lm_lck, RW_READER);
+	TAILQ_FOREACH(g, &nlm_zones_list, nlm_link)
+		nlm_suspend_zone(g);
+
+	rw_exit(&lm_lck);
+}
+
+void
+nlm_cprresume(void)
+{
+	struct nlm_globals *g;
+
+	rw_enter(&lm_lck, RW_READER);
+	TAILQ_FOREACH(g, &nlm_zones_list, nlm_link)
+		nlm_resume_zone(g);
+
+	rw_exit(&lm_lck);
 }

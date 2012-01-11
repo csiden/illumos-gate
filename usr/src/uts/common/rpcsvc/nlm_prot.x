@@ -21,6 +21,7 @@
  */
 /*
  * Network lock manager protocol definition
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (C) 1986, 1992, 1993, 1997, 1999 by Sun Microsystems, Inc.
  * All rights reserved.
  *
@@ -330,6 +331,9 @@ program NLM_PROG {
 
 	version NLM_VERS {
 
+		void
+			NLM_NULL(void) =			0;
+
 		nlm_testres
 			NLM_TEST(nlm_testargs) =		1;
 
@@ -396,6 +400,8 @@ program NLM_PROG {
 	} = 3;
 
 	version NLM4_VERS {
+		void
+			NLM4_NULL(void) =			0;
 		nlm4_testres
 			NLM4_TEST(nlm4_testargs) =		1;
 		nlm4_res

@@ -1469,17 +1469,18 @@ RPCMOD_OBJS +=	rpcmod.o	clnt_cots.o	clnt_clts.o \
 
 KLMMOD_OBJS +=	klmmod.o \
 		nlm_impl.o \
+		nlm_rpc_handle.o \
 		nlm_dispatch.o \
 		nlm_rpc_svc.o \
+		nlm_client.o \
 		nlm_service.o \
 		nlm_prot_clnt.o \
 		nlm_prot_xdr.o \
+		nlm_rpc_clnt.o \
 		sm_inter_clnt.o \
-		sm_inter_xdr.o \
+		sm_inter_xdr.o
 
-KLMOPS_OBJS +=	klmops.o \
-		nlm_client.o \
-		nlm_rpc_clnt.o
+KLMOPS_OBJS +=	klmops.o
 
 TLIMOD_OBJS +=	tlimod.o	t_kalloc.o	t_kbind.o	t_kclose.o \
 		t_kconnect.o	t_kfree.o	t_kgtstate.o	t_kopen.o \

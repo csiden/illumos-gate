@@ -10,12 +10,12 @@
  */
 
 /*
- * Copyright 2010 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright 2012 Nexenta Systems, Inc.  All rights reserved.
  */
 
 /*
  * NFS Lock Manager, server-side dispatch tables and
- * dispatch programs: nlm_prog_[234]
+ * dispatch programs: nlm_prog_3, nlm_prog4
  *
  * These are called by RPC framework after the RPC service
  * endpoints setup done in nlm_impl.c: nlm_svc_add_ep().
@@ -25,6 +25,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/sdt.h>
 #include <rpcsvc/nlm_prot.h>
 #include "nlm_impl.h"
 
@@ -38,7 +39,9 @@ struct dispatch_entry {
 	xdrproc_t	de_xres;
 	uint_t		de_flags;
 	/* Flag bits in de_flags */
+
 #define	NLM_DISP_NOREPLY	1	/* Skip svc_sendreply */
+#define	NLM_DISP_NOREMOTE	2	/* Local calls only */
 };
 
 /*
@@ -56,7 +59,7 @@ nlm_null_svc(void *args, void *resp, struct svc_req *sr)
 
 /*
  * The common NLM service dispatch function, used by
- * all three of: nlm_prog_2, nlm_prog_3, nlm_prog_4
+ * both: nlm_prog_3, nlm_prog_4
  */
 void
 nlm_dispatch(
@@ -96,43 +99,63 @@ nlm_dispatch(
 
 	} resu;
 	bool_t (*func)(char *, void *, struct svc_req *);
-	xdrproc_t xargs, xres;
-	int flags;
-	bool_t retval;
+	bool_t do_reply;
 
 	if ((func = de->de_func) == NULL) {
 		svcerr_noproc(transp);
 		return;
 	}
-	xargs = de->de_xargs;
-	xres  = de->de_xres;
-	flags = de->de_flags;
+
+
+	if ((de->de_flags & NLM_DISP_NOREMOTE) &&
+	    !nlm_caller_is_local(transp)) {
+		svcerr_noproc(transp);
+		return;
+	}
 
 	/*
-	 * This section from rpcgen
+	 * This section from rpcgen, and then modified slightly.
+	 *
+	 * Dispatch entries that should _never_ send a response
+	 * (i.e. all the _MSG and _RES entries) put NULL in the
+	 * de_xres field to indicate that.  For such entries, we
+	 * will NOT call svc_sendreply nor xdr_free().  Normal
+	 * dispatch entries skip svc_sendreply if the dispatch
+	 * function returns zero, but always call xdr_free().
+	 *
+	 * There are more complex cases where some dispatch
+	 * functions need to send their own reply.  We chose
+	 * to indicate those using a flag (NLM_DISP_NOREPLY).
+	 * XXX: In retrospect a NULL de_xres field might have
+	 * worked just as well.  That service function would
+	 * simply need to call xdr_free itself.  (would only
+	 * affect nlm_do_lock and it's callers)
 	 */
-
 	bzero((char *)&argu, sizeof (argu));
-	if (!SVC_GETARGS(transp, xargs, (caddr_t)&argu)) {
+	if (!SVC_GETARGS(transp, de->de_xargs, (caddr_t)&argu)) {
 		svcerr_decode(transp);
 		return;
 	}
+
 	bzero((char *)&resu, sizeof (resu));
+	do_reply = (*func)((char *)&argu, (void *)&resu, rqstp);
 
-	retval = (*func)((char *)&argu, (void *)&resu, rqstp);
+	if (do_reply && !(de->de_flags & NLM_DISP_NOREPLY)) {
+		ASSERT(de->de_xres != (xdrproc_t)0);
+		DTRACE_PROBE3(sendreply, struct svc_req *, rqstp,
+		    SVCXPRT *, transp, struct dispatch_entry *, de);
 
-	if (xres && retval != 0 &&
-	    (flags & NLM_DISP_NOREPLY) != 0) {
-		if (!svc_sendreply(transp, xres, (char *)&resu))
+		if (!svc_sendreply(transp, de->de_xres, (char *)&resu)) {
 			svcerr_systemerr(transp);
+			NLM_ERR("nlm_dispatch(): svc_sendreply() failed!\n");
+		}
 	}
-	if (!SVC_FREEARGS(transp, xargs, (caddr_t)&argu)) {
-		RPC_MSGOUT("%s",
-		    "unable to free arguments");
-	}
-	if (xres != NULL) {
-		xdr_free(xres, (caddr_t)&resu);
-	}
+
+	if (!SVC_FREEARGS(transp, de->de_xargs, (caddr_t)&argu))
+		NLM_WARN("nlm_dispatch(): unable to free arguments");
+
+	if (de->de_xres != (xdrproc_t)0)
+		xdr_free(de->de_xres, (caddr_t)&resu);
 }
 
 /*
@@ -143,86 +166,8 @@ nlm_dispatch(
  */
 
 /*
- * Dispatch table for version 2 (NLM_SM)
- * NB: These are the real v2 entries, bound ONLY
- * for RPC service on loopback transports.
- *
- * Careful: the offsets in this table are NOT the
- * procedure numbers.  See nlm_prog_2 below.
- * It's a table only because that was easy.
- */
-static const struct dispatch_entry
-nlm_prog_2_table[] = {
-
-	{ /* 0: NULLPROC */
-	RPCGEN_ACTION(nlm_null_svc),
-	(xdrproc_t)xdr_void,
-	(xdrproc_t)xdr_void,
-	0 },
-
-	{ /* 17: NLM_SM_NOTIFY1 */
-	RPCGEN_ACTION(nlm_sm_notify1_2_svc),
-	(xdrproc_t)xdr_nlm_sm_status,
-	(xdrproc_t)xdr_void,
-	0 },
-
-	{ /* 18: NLM_SM_NOTIFY2 */
-	RPCGEN_ACTION(nlm_sm_notify2_2_svc),
-	(xdrproc_t)xdr_nlm_sm_status,
-	(xdrproc_t)xdr_void,
-	0 },
-};
-
-/*
- * RPC dispatch function for version 2 ONLY.
- * This provides the real v2 functions, bound
- * ONLY on loopback transports.
- */
-void
-nlm_prog_2(struct svc_req *rqstp, register SVCXPRT *transp)
-{
-	const struct dispatch_entry *de;
-
-	if (rqstp->rq_vers != NLM_SM) {
-		/* paranoid */
-		svcerr_noprog(transp);
-		return;
-	}
-
-	/*
-	 * Note: the offsets in nlm_prog_2_table
-	 * are NOT the procedure numbers.
-	 */
-	switch (rqstp->rq_proc) {
-	case NULLPROC:
-		de = &nlm_prog_2_table[0];
-		break;
-
-	case NLM_SM_NOTIFY1:
-		de = &nlm_prog_2_table[1];
-		break;
-
-	case NLM_SM_NOTIFY2:
-		de = &nlm_prog_2_table[2];
-		break;
-
-	default:
-		svcerr_noproc(transp);
-		return; /* CSTYLED */
-	}
-
-	nlm_dispatch(rqstp, transp, de);
-}
-
-
-/*
- * Dispatch table for  versions 1, 2, 3
+ * Dispatch table for versions 1, 2, 3
  * (NLM_VERS, NLM_SM, NLM_VERSX)
- * for normal (remote) callers.
- *
- * Note that the v2 entries are "noprog" here, as the
- * v2 functions are only available on loopback, which
- * uses the nlm_prog_2() dispatch function above.
  */
 static const struct dispatch_entry
 nlm_prog_3_table[] = {
@@ -333,32 +278,23 @@ nlm_prog_3_table[] = {
 	(xdrproc_t)0,
 	0 },
 
-	/*
-	 * Version 2 (NLM_SM) entries.
-	 *
-	 * Note that rpcgen puts the NLM_SM_NOTIFY* functions here.
-	 * We only allow those on loopback transports, and use the
-	 * nlm_prog_2() service dispatch for those.  Other transports
-	 * use this table, which has null entries for these.
-	 */
-
 	{ /* 16: not used */
 	RPCGEN_ACTION(0),
 	(xdrproc_t)0,
 	(xdrproc_t)0,
 	0 },
 
-	{ /* 17: NLM_SM_NOTIFY1 - See nlm_prog_2() */
-	RPCGEN_ACTION(0),
-	(xdrproc_t)0,
-	(xdrproc_t)0,
-	0 },
+	{ /* 17: NLM_SM_NOTIFY1 */
+	RPCGEN_ACTION(nlm_sm_notify1_2_svc),
+	(xdrproc_t)xdr_nlm_sm_status,
+	(xdrproc_t)xdr_void,
+	NLM_DISP_NOREMOTE },
 
-	{ /* 18: NLM_SM_NOTIFY2 - See nlm_prog_2() */
-	RPCGEN_ACTION(0),
-	(xdrproc_t)0,
-	(xdrproc_t)0,
-	0 },
+	{ /* 18: NLM_SM_NOTIFY2 */
+	RPCGEN_ACTION(nlm_sm_notify2_2_svc),
+	(xdrproc_t)xdr_nlm_sm_status,
+	(xdrproc_t)xdr_void,
+	NLM_DISP_NOREMOTE },
 
 	/*
 	 * Version 3 (NLM_VERSX) entries.
@@ -417,7 +353,9 @@ nlm_prog_3(struct svc_req *rqstp, register SVCXPRT *transp)
 	case NLM_VERSX:
 		max_proc = NLM_FREE_ALL;
 		break;
-	default: /* paranoid */
+	default:
+		/* Our svc registration should prevent this. */
+		ASSERT(0); /* paranoid */
 		svcerr_noprog(transp);
 		return;
 	}
@@ -434,7 +372,7 @@ nlm_prog_3(struct svc_req *rqstp, register SVCXPRT *transp)
 }
 
 /*
- * Dispatch table for version 4 (NLM4_vers)
+ * Dispatch table for version 4 (NLM4_VERS)
  */
 static const struct dispatch_entry
 nlm_prog_4_table[] = {
@@ -547,13 +485,13 @@ nlm_prog_4_table[] = {
 	(xdrproc_t)0,
 	0 },
 
-	{ /* 17: NLM_SM_NOTIFY1 - See nlm_prog_2() */
+	{ /* 17: NLM_SM_NOTIFY1 (not in v4) */
 	RPCGEN_ACTION(0),
 	(xdrproc_t)0,
 	(xdrproc_t)0,
 	0 },
 
-	{ /* 18: NLM_SM_NOTIFY2 - See nlm_prog_2() */
+	{ /* 18: NLM_SM_NOTIFY2 (not in v4) */
 	RPCGEN_ACTION(0),
 	(xdrproc_t)0,
 	(xdrproc_t)0,
@@ -602,7 +540,8 @@ nlm_prog_4(struct svc_req *rqstp, register SVCXPRT *transp)
 	const struct dispatch_entry *de;
 
 	if (rqstp->rq_vers != NLM4_VERS) {
-		/* paranoid */
+		/* Our svc registration should prevent this. */
+		ASSERT(0); /* paranoid */
 		svcerr_noprog(transp);
 		return;
 	}

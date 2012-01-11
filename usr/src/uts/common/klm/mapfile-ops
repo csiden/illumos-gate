@@ -10,7 +10,7 @@
 #
 
 #
-# Copyright 2010 Nexenta Systems, Inc.  All rights reserved.
+# Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
 #
 
 
@@ -34,7 +34,6 @@ SYMBOL_SCOPE {
 		lm_nlm_dispatch;
 		lm_nlm_reclaim;
 		lm_register_lock_locally;
-		lm_shrlock;
 
 	local:
 		*;

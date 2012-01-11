@@ -28,14 +28,6 @@ install_h: all_h
 
 all_h: $(DERIVED_FILES)
 
-# XXX: Not sure yet if we want to use this generated code,
-# XXX: or nlm_dispatch.c instead.  The latter for now.
-# XXX: DERIVED_FILES += nlm_prot_svc.c
-nlm_prot_svc.c : $(NLM_PROT_X) nlm_prot_svc.sed
-	$(RPCGEN) $(RPCGENFLAGS) -m -o $@.tmp $(NLM_PROT_X)
-	sed -f nlm_prot_svc.sed < $@.tmp > $@
-	$(RM) -f $@.tmp
-
 nlm_prot_clnt.c : $(NLM_PROT_X) nlm_prot_clnt.sed
 	$(RPCGEN) $(RPCGENFLAGS) -l -o $@.tmp $(NLM_PROT_X)
 	sed -f nlm_prot_clnt.sed < $@.tmp > $@

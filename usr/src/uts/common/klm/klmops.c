@@ -10,7 +10,7 @@
  */
 
 /*
- * Copyright 2010 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  */
 
 /*
@@ -48,14 +48,12 @@ static struct modlinkage modlinkage = {
 int
 _init()
 {
-	nlm_set_recovery_cb(nlm_client_recovery);
 	return (mod_install(&modlinkage));
 }
 
 int
 _fini()
 {
-	/* nlm_set_recovery_cb(NULL); */
 	/* Don't unload. */
 	return (EBUSY);
 }
@@ -80,13 +78,11 @@ _info(struct modinfo *modinfop)
  */
 int
 lm_frlock(struct vnode *vp, int cmd, struct flock64 *flk, int flags,
-	u_offset_t off, struct cred *cr, struct netobj *fh,
-	struct flk_callback *flcb)
+    u_offset_t off, struct cred *cr, struct netobj *fh,
+    struct flk_callback *flcb)
 {
-	int err;
-	err = nlm_frlock(vp, cmd, flk, flags, off,
-	    cr, fh, flcb, NLM_VERS);
-	return (err);
+	return (nlm_frlock(vp, cmd, flk, flags, off,
+	    cr, fh, flcb, NLM_VERS));
 }
 
 /*
@@ -110,11 +106,9 @@ lm4_frlock(struct vnode *vp, int cmd, struct flock64 *flk, int flags,
  */
 int
 lm_shrlock(struct vnode *vp, int cmd,
-	struct shrlock *shr, int flags, struct netobj *fh)
+    struct shrlock *shr, int flags, struct netobj *fh)
 {
-	int err;
-	err = nlm_shrlock(vp, cmd, shr, flags, fh, NLM_VERSX);
-	return (err);
+	return (nlm_shrlock(vp, cmd, shr, flags, fh, NLM_VERSX));
 }
 
 /*
@@ -123,11 +117,9 @@ lm_shrlock(struct vnode *vp, int cmd,
  */
 int
 lm4_shrlock(struct vnode *vp, int cmd,
-	struct shrlock *shr, int flags, struct netobj *fh)
+    struct shrlock *shr, int flags, struct netobj *fh)
 {
-	int err;
-	err = nlm_shrlock(vp, cmd, shr, flags, fh, NLM4_VERS);
-	return (err);
+	return (nlm_shrlock(vp, cmd, shr, flags, fh, NLM4_VERS));
 }
 
 /*
@@ -136,14 +128,11 @@ lm4_shrlock(struct vnode *vp, int cmd,
  * register the lock locally.
  */
 void
-lm_register_lock_locally(
-	struct vnode *vp,
-	struct lm_sysid *ls,
-	struct flock64 *flk,
-	int flags,
-	u_offset_t offset)
+lm_register_lock_locally(struct vnode *vp, struct lm_sysid *ls,
+    struct flock64 *flk, int flags, u_offset_t offset)
 {
-	/* Calls os/flock.c: reclock() */
+	nlm_register_lock_locally(vp, (struct nlm_host *)ls,
+	    flk, flags, offset);
 }
 
 /*
@@ -153,10 +142,13 @@ lm_register_lock_locally(
 void
 lm_nlm_dispatch(struct svc_req *req, SVCXPRT *xprt)
 {
+	_NOTE(ARGUNUSED(req, xprt))
 }
+
 void
 lm_nlm4_dispatch(struct svc_req *req, SVCXPRT *xprt)
 {
+	_NOTE(ARGUNUSED(req, xprt))
 }
 
 /*
@@ -168,8 +160,11 @@ lm_nlm4_dispatch(struct svc_req *req, SVCXPRT *xprt)
 void
 lm_nlm_reclaim(struct vnode *vp, struct flock64 *flkp)
 {
+	_NOTE(ARGUNUSED(vp, flkp))
 }
+
 void
 lm_nlm4_reclaim(struct vnode *vp, struct flock64 *flkp)
 {
+	_NOTE(ARGUNUSED(vp, flkp))
 }

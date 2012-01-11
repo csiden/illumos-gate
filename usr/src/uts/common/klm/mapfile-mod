@@ -10,7 +10,7 @@
 #
 
 #
-# Copyright 2010 Nexenta Systems, Inc.  All rights reserved.
+# Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
 #
 
 
@@ -31,15 +31,24 @@ SYMBOL_SCOPE {
 		lm_free_config;
 		lm_free_sysidt;
 		lm_get_sysid;
+		lm_global_nlmid;
 		lm_has_sleep;
 		lm_rel_sysid;
+		lm_remove_file_locks;
 		lm_safelock;
 		lm_safemap;
+		lm_set_nlmid_flk;
 		lm_shutdown;
 		lm_svc;
 		lm_sysidt;
 		lm_unexport;
 		lm_vp_active;
+# The following three functions are not mentioned in modstubs.s
+# files, because they are not an entry points to KLM. They
+# are called from klmops only.
+		nlm_frlock;
+		nlm_register_lock_locally;
+		nlm_shrlock;
 
 	local:
 		*;

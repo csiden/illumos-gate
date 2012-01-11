@@ -20,14 +20,13 @@
  * CDDL HEADER END
  */
 /*
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  * Copyright 2005 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
 
 #ifndef _NFS_LM_H
 #define	_NFS_LM_H
-
-#pragma ident	"%Z%%M%	%I%	%E% SMI"
 
 /*
  * Interface definitions for the NFSv2/v3 lock manager.
@@ -42,13 +41,14 @@ extern "C" {
 #include <sys/types.h>
 #include <sys/vnode.h>
 #include <rpc/rpc.h>
-#include <nfs/export.h>
 
 #ifdef _KERNEL
 
 /*
  * Common interfaces.
  */
+
+struct exportinfo;
 
 /*
  * The numeric sysid is used to identify a host and transport.
@@ -154,15 +154,13 @@ extern int lm_vp_active(const struct vnode *);
 extern sysid_t		   lm_alloc_sysidt(void);
 extern void		   lm_free_sysidt(sysid_t);
 
-#else /* _KERNEL */
+#endif /* _KERNEL */
 
 #ifdef __STDC__
 extern int lm_shutdown(void);
 #else
 extern int lm_shutdown();
 #endif /* __STDC__ */
-
-#endif /* _KERNEL */
 
 #ifdef __cplusplus
 }

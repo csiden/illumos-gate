@@ -9,7 +9,7 @@
 # at http://www.illumos.org/license/CDDL.
 #
 #
-# Copyright 2010 Nexenta Systems, Inc.  All rights reserved.
+# Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
 #
 6{
 i\
@@ -20,3 +20,4 @@ i\
 #include <rpcsvc/sm_inter.h>
 }
 /^.include/,/^.endif/d
+

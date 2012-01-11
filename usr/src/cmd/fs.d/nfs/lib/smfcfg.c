@@ -19,6 +19,9 @@
  * CDDL HEADER END
  */
 /*
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ */
+/*
  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
  */
 #include <stdio.h>
