@@ -67,7 +67,9 @@ typedef struct bpobj {
 typedef int bpobj_itor_t(void *arg, const blkptr_t *bp, dmu_tx_t *tx);
 
 uint64_t bpobj_alloc(objset_t *mos, int blocksize, dmu_tx_t *tx);
+uint64_t bpobj_alloc_empty(objset_t *os, int blocksize, dmu_tx_t *tx);
 void bpobj_free(objset_t *os, uint64_t obj, dmu_tx_t *tx);
+void bpobj_decr_empty(objset_t *os, dmu_tx_t *tx);
 
 int bpobj_open(bpobj_t *bpo, objset_t *mos, uint64_t object);
 void bpobj_close(bpobj_t *bpo);
