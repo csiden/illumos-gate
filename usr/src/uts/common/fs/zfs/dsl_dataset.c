@@ -934,7 +934,6 @@ dmu_snapshots_destroy_nvl(nvlist_t *snaps, boolean_t defer, char *failed)
 	for (pair = nvlist_next_nvpair(snaps, NULL); pair != NULL;
 	    pair = nvlist_next_nvpair(snaps, pair)) {
 		dsl_dataset_t *ds;
-		int err;
 
 		err = dsl_dataset_own(nvpair_name(pair), B_TRUE, dstg, &ds);
 		if (err == 0) {
@@ -2218,8 +2217,22 @@ get_clones_stat(dsl_dataset_t *ds, nvlist_t *nv)
 	    zap_cursor_advance(&zc)) {
 		dsl_dataset_t *clone;
 		char buf[ZFS_MAXNAMELEN];
-		VERIFY3U(0, ==, dsl_dataset_hold_obj(ds->ds_dir->dd_pool,
-		    za.za_first_integer, FTAG, &clone));
+		/*
+		 * Even though we hold the dp_config_rwlock, the dataset
+		 * may fail to open, returning ENOENT.  If there is a
+		 * thread concurrently attempting to destroy this
+		 * dataset, it will have the ds_rwlock held for
+		 * RW_WRITER.  Our call to dsl_dataset_hold_obj() ->
+		 * dsl_dataset_hold_ref() will fail its
+		 * rw_tryenter(&ds->ds_rwlock, RW_READER), drop the
+		 * dp_config_rwlock, and wait for the destroy progress
+		 * and signal ds_exclusive_cv.  If the destroy was
+		 * successful, we will see that
+		 * DSL_DATASET_IS_DESTROYED(), and return ENOENT.
+		 */
+		if (dsl_dataset_hold_obj(ds->ds_dir->dd_pool,
+		    za.za_first_integer, FTAG, &clone) != 0)
+			continue;
 		dsl_dir_name(clone->ds_dir, buf);
 		VERIFY(nvlist_add_boolean(val, buf) == 0);
 		dsl_dataset_rele(clone, FTAG);
@@ -4189,9 +4202,13 @@ dsl_dataset_space_written(dsl_dataset_t *oldsnap, dsl_dataset_t *new,
 		dsl_dataset_t *snap;
 		uint64_t used, comp, uncomp;
 
-		err = dsl_dataset_hold_obj(dp, snapobj, FTAG, &snap);
-		if (err != 0)
-			break;
+		if (snapobj == new->ds_object) {
+			snap = new;
+		} else {
+			err = dsl_dataset_hold_obj(dp, snapobj, FTAG, &snap);
+			if (err != 0)
+				break;
+		}
 
 		if (snap->ds_phys->ds_prev_snap_txg ==
 		    oldsnap->ds_phys->ds_creation_txg) {
@@ -4220,7 +4237,8 @@ dsl_dataset_space_written(dsl_dataset_t *oldsnap, dsl_dataset_t *new,
 		 * was not a snapshot of/before new.
 		 */
 		snapobj = snap->ds_phys->ds_prev_snap_obj;
-		dsl_dataset_rele(snap, FTAG);
+		if (snap != new)
+			dsl_dataset_rele(snap, FTAG);
 		if (snapobj == 0) {
 			err = EINVAL;
 			break;

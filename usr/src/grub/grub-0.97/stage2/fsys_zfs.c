@@ -719,8 +719,11 @@ zap_iterate(dnode_phys_t *zap_dnode, zap_cb_t *cb, void *arg, char *stack)
 	 * features for read), we can add support for fatzap iteration.
 	 * For now, fail.
 	 */
-	if (mzp->mz_block_type != ZBT_MICRO)
+	if (mzp->mz_block_type != ZBT_MICRO) {
+		grub_printf("feature information stored in fatzap, pool "
+		    "version not supported\n");
 		return (1);
+	}
 
 	za.za_integer_length = 8;
 	za.za_num_integers = 1;
@@ -828,12 +831,11 @@ check_feature(zap_attribute_t *za, void *arg, char *stack)
 
 	for (i = 0; names[i] != NULL; i++) {
 		if (grub_strcmp(za->za_name, names[i]) == 0) {
-			grub_printf("missing feature for read '%s'\n",
-			    za->za_name);
-			return (ERR_NEWER_VERSION);
+			return (0);
 		}
 	}
-	return (0);
+	grub_printf("missing feature for read '%s'\n", za->za_name);
+	return (ERR_NEWER_VERSION);
 }
 
 /*
@@ -1416,12 +1418,12 @@ vdev_get_bootpath(char *nv, uint64_t inguid, char *devid, char *bootpath,
  */
 static int
 check_pool_label(uint64_t sector, char *stack, char *outdevid,
-    char *outpath, uint64_t *outguid, uint64_t *outashift)
+    char *outpath, uint64_t *outguid, uint64_t *outashift, uint64_t *outversion)
 {
 	vdev_phys_t *vdev;
 	uint64_t pool_state, txg = 0;
 	char *nvlist, *nv, *features;
-	uint64_t diskguid, version;
+	uint64_t diskguid;
 
 	sector += (VDEV_SKIP_SIZE >> SPA_MINBLOCKSHIFT);
 
@@ -1454,10 +1456,10 @@ check_pool_label(uint64_t sector, char *stack, char *outdevid,
 	if (txg == 0)
 		return (ERR_NO_BOOTPATH);
 
-	if (nvlist_lookup_value(nvlist, ZPOOL_CONFIG_VERSION, &version,
+	if (nvlist_lookup_value(nvlist, ZPOOL_CONFIG_VERSION, outversion,
 	    DATA_TYPE_UINT64, NULL))
 		return (ERR_FSYS_CORRUPT);
-	if (!SPA_VERSION_IS_SUPPORTED(version))
+	if (!SPA_VERSION_IS_SUPPORTED(*outversion))
 		return (ERR_NEWER_VERSION);
 	if (nvlist_lookup_value(nvlist, ZPOOL_CONFIG_VDEV_TREE, &nv,
 	    DATA_TYPE_NVLIST, NULL))
@@ -1517,7 +1519,7 @@ zfs_mount(void)
 	objset_phys_t *osp;
 	char tmp_bootpath[MAXNAMELEN];
 	char tmp_devid[MAXNAMELEN];
-	uint64_t tmp_guid, ashift;
+	uint64_t tmp_guid, ashift, version;
 	uint64_t adjpl = (uint64_t)part_length << SPA_MINBLOCKSHIFT;
 	int err = errnum; /* preserve previous errnum state */
 
@@ -1560,7 +1562,7 @@ zfs_mount(void)
 			continue;
 
 		if (check_pool_label(sector, stack, tmp_devid,
-		    tmp_bootpath, &tmp_guid, &ashift))
+		    tmp_bootpath, &tmp_guid, &ashift, &version))
 			continue;
 
 		if (pool_guid == 0)
@@ -1571,6 +1573,10 @@ zfs_mount(void)
 			continue;
 
 		VERIFY_OS_TYPE(osp, DMU_OST_META);
+
+		if (version >= SPA_VERSION_FEATURES &&
+		    check_mos_features(&osp->os_meta_dnode, stack) != 0)
+			continue;
 
 		if (find_best_root && ((pool_guid != tmp_guid) ||
 		    vdev_uberblock_compare(ubbest, &(current_uberblock)) <= 0))
