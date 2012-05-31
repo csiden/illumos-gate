@@ -135,6 +135,11 @@ void l2arc_fini(void);
 void l2arc_start(void);
 void l2arc_stop(void);
 
+#ifndef _KERNEL
+extern boolean_t arc_watch;
+extern int arc_procfd;
+#endif
+
 #ifdef	__cplusplus
 }
 #endif
