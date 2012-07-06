@@ -27,6 +27,10 @@
 /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T */
 /*	All Rights Reserved */
 
+/*
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ */
+
 #include <sys/flock_impl.h>
 #include <sys/vfs.h>
 #include <sys/t_lock.h>		/* for <sys/callb.h> */
@@ -2277,6 +2281,57 @@ flk_has_remote_locks(vnode_t *vp)
 	if (lock) {
 		while (lock->l_vnode == vp) {
 			if (IS_REMOTE(lock)) {
+				result = 1;
+				goto done;
+			}
+			lock = lock->l_next;
+		}
+	}
+
+done:
+	mutex_exit(&gp->gp_mutex);
+	return (result);
+}
+
+/*
+ * Determine whether there are any locks for the given vnode with a remote
+ * sysid matching given sysid.
+ * Used by the new (open source) NFS Lock Manager (NLM)
+ */
+int
+flk_has_remote_locks_for_sysid(vnode_t *vp, int sysid)
+{
+	lock_descriptor_t *lock;
+	int result = 0;
+	graph_t *gp;
+
+	if (sysid == 0)
+		return (0);
+
+	gp = flk_get_lock_graph(vp, FLK_USE_GRAPH);
+	if (gp == NULL) {
+		return (0);
+	}
+
+	mutex_enter(&gp->gp_mutex);
+
+	SET_LOCK_TO_FIRST_ACTIVE_VP(gp, lock, vp);
+
+	if (lock) {
+		while (lock->l_vnode == vp) {
+			if (lock->l_flock.l_sysid == sysid) {
+				result = 1;
+				goto done;
+			}
+			lock = lock->l_next;
+		}
+	}
+
+	SET_LOCK_TO_FIRST_SLEEP_VP(gp, lock, vp);
+
+	if (lock) {
+		while (lock->l_vnode == vp) {
+			if (lock->l_flock.l_sysid == sysid) {
 				result = 1;
 				goto done;
 			}
