@@ -106,7 +106,7 @@ struct nlm_knc {
 #define	NLM_BMAP_WORDS  (NLM_BMAP_NITEMS / BT_NBIPUL)
 
 /*
- * Given an integer x, the macro returns
+ * Given an interger x, the macro returs
  * -1 if x is negative,
  *  0 if x is zero
  *  1 if x is positive
@@ -1507,11 +1507,11 @@ nlm_netbuf_addrs_cmp(struct netbuf *nb1, struct netbuf *nb2)
 
 	switch (na1->sa.sa_family) {
 	case AF_INET:
-		res = bcmp(&na1->sin.sin_addr, &na2->sin.sin_addr,
+		res = memcmp(&na1->sin.sin_addr, &na2->sin.sin_addr,
 		    sizeof (na1->sin.sin_addr));
 		break;
 	case AF_INET6:
-		res = bcmp(&na1->sin6.sin6_addr, &na2->sin6.sin6_addr,
+		res = memcmp(&na1->sin6.sin6_addr, &na2->sin6.sin6_addr,
 		    sizeof (na1->sin6.sin6_addr));
 		break;
 	default:
