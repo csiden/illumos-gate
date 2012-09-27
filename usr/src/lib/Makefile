@@ -21,6 +21,7 @@
 
 # Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
 # Copyright (c) 1989, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2012 by Delphix. All rights reserved.
 
 include ../Makefile.master
 
@@ -112,7 +113,6 @@ SUBDIRS += \
 	libipmp		\
 	libiscsit	\
 	libkmf		\
-	libkmsagent	\
 	libkstat	\
 	libkvm		\
 	liblm		\
@@ -126,7 +126,6 @@ SUBDIRS += \
 	libumem		\
 	libnvpair	.WAIT	\
 	libexacct	\
-	libldap4	\
 	libsasl		\
 	libldap5	\
 	libsldap	.WAIT	\
@@ -236,9 +235,10 @@ SUBDIRS += \
 	sasl_plugins	\
 	udapl		\
 	libzpool	\
+	libzfs_core	\
 	libzfs		\
-	libbe 		\
-	pylibbe 	\
+	libbe		\
+	pylibbe		\
 	libzfs_jni	\
 	pyzfs		\
 	pysolaris	\
@@ -476,6 +476,7 @@ HDRSUBDIRS=		\
 	libwrap		\
 	libxcurses2	\
 	libzfs		\
+	libzfs_core	\
 	libzfs_jni	\
 	libzoneinfo	\
 	libzonestat	\
@@ -636,11 +637,12 @@ libinetsvc:	libscf
 librestart:	libuutil libscf
 ../cmd/sgs/libdl:	../cmd/sgs/libconv
 ../cmd/sgs/libelf:	../cmd/sgs/libconv
-pkcs11:		libcryptoutil libkmsagent
+pkcs11:		libcryptoutil
 print:		libldap5
 udapl/udapl_tavor:	udapl/libdat
 libzfs:		libdevid libgen libnvpair libuutil \
-		libadm libavl libefi libidmap libmd
+		libadm libavl libefi libidmap libmd libzfs_core
+libzfs_core:	libnvpair
 libzfs_jni:	libdiskmgt libnvpair libzfs
 libzpool:	libavl libumem libnvpair libcmdutils
 libsec:		libavl libidmap

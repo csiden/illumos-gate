@@ -19,9 +19,14 @@
 # CDDL HEADER END
 #
 #
-# Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
 # Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
+#
+
+#
+# Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+# Copyright (c) 2012 by Delphix. All rights reserved.
+# Copyright (c) 2012 Joyent, Inc. All rights reserved.
 #
 
 .KEEP_STATE:
@@ -76,6 +81,7 @@ SRCS += \
 	mdb_stdlib.c \
 	mdb_string.c \
 	mdb_strio.c \
+	mdb_tab.c \
 	mdb_target.c \
 	mdb_tdb.c \
 	mdb_termio.c \
@@ -92,6 +98,13 @@ C99MODE=	-xc99=%all
 C99LMODE=	-Xc99=%all
 
 LDLIBS += -lcurses -lkvm -lproc -lrtld_db -lctf -lumem -ldisasm -lscf
+
+CERRWARN += -_gcc=-Wno-uninitialized
+CERRWARN += -_gcc=-Wno-char-subscripts
+CERRWARN += -_gcc=-Wno-clobbered
+CERRWARN += -_gcc=-Wno-parentheses
+CERRWARN += -_gcc=-Wno-unused-label
+CERRWARN += -_gcc=-Wno-unused-variable
 
 #
 # -erroff=E_INCONS_ARG_DECL2 works around a problem where lint gets confused

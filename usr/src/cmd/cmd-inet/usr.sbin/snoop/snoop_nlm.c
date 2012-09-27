@@ -27,8 +27,6 @@
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  */
 
-#pragma ident	"%Z%%M%	%I%	%E% SMI"
-
 #include <sys/types.h>
 #include <setjmp.h>
 #include <string.h>
@@ -469,8 +467,8 @@ show_stat()
 
 	s = (enum nlm_stats) getxdr_u_long();
 	(void) sprintf(get_line(0, 0),
-		"Status = %d (%s)",
-		s, nameof_stat((ulong_t)s));
+	    "Status = %d (%s)",
+	    s, nameof_stat((ulong_t)s));
 
 	return (s);
 }
@@ -656,8 +654,8 @@ show_nlm_mode()
 
 	m = (enum fsh_mode) getxdr_u_long();
 	(void) sprintf(get_line(0, 0),
-		"Mode = %d (%s)",
-		m, nameof_mode((uint_t)m));
+	    "Mode = %d (%s)",
+	    m, nameof_mode((uint_t)m));
 }
 
 static void
@@ -667,8 +665,8 @@ show_nlm_access()
 
 	a = (enum fsh_access) getxdr_u_long();
 	(void) sprintf(get_line(0, 0),
-		"Access = %d (%s)",
-		a, nameof_access((uint_t)a));
+	    "Access = %d (%s)",
+	    a, nameof_access((uint_t)a));
 }
 
 static char *
@@ -1108,8 +1106,8 @@ show_stat4()
 
 	s = (enum nlm4_stats) getxdr_u_long();
 	(void) sprintf(get_line(0, 0),
-		"Status = %d (%s)",
-		s, nameof_stat4((ulong_t)s));
+	    "Status = %d (%s)",
+	    s, nameof_stat4((ulong_t)s));
 
 	return (s);
 }
@@ -1118,7 +1116,7 @@ static void
 show_testres4()
 {
 	show_netobj("Cookie = %s");
-	if (show_stat() == nlm4_denied) {
+	if (show_stat() == nlm_denied) {
 		showxdr_bool("Exclusive = %s");
 		showxdr_long("Svid = %ld (process id)");
 		show_netobj("Owner handle = %s");

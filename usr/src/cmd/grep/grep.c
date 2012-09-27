@@ -30,7 +30,7 @@
 /*	Copyright (c) 1987, 1988 Microsoft Corporation	*/
 /*	  All Rights Reserved	*/
 
-#pragma ident	"%Z%%M%	%I%	%E% SMI"
+/* Copyright 2012 Nexenta Systems, Inc.  All rights reserved. */
 
 /*
  * grep -- print lines matching (or not matching) a pattern
@@ -52,6 +52,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <ftw.h>
+#include <limits.h>
+#include <sys/param.h>
 
 static const char *errstr[] = {
 	"Range endpoint too large.",
@@ -73,6 +76,7 @@ static const char *errstr[] = {
 #define	errmsg(msg, arg)	(void) fprintf(stderr, gettext(msg), arg)
 #define	BLKSIZE	512
 #define	GBUFSIZ	8192
+#define	MAX_DEPTH	1000
 
 static int	temp;
 static long long	lnum;
@@ -83,22 +87,28 @@ static int	nflag;
 static int	bflag;
 static int	lflag;
 static int	cflag;
+static int	rflag;
+static int	Rflag;
 static int	vflag;
 static int	sflag;
 static int	iflag;
 static int	wflag;
 static int	hflag;
+static int	qflag;
 static int	errflg;
 static int	nfile;
 static long long	tln;
 static int	nsucc;
+static int	outfn = 0;
 static int	nlflag;
 static char	*ptr, *ptrend;
 static char	*expbuf;
 
-static void	execute(char *);
+static void	execute(const char *, int);
 static void	regerr(int);
-static int	succeed(char *);
+static void	prepare(const char *);
+static int	recursive(const char *, const struct stat *, int, struct FTW *);
+static int	succeed(const char *);
 
 int
 main(int argc, char **argv)
@@ -113,10 +123,13 @@ main(int argc, char **argv)
 #endif
 	(void) textdomain(TEXT_DOMAIN);
 
-	while ((c = getopt(argc, argv, "hblcnsviyw")) != -1)
+	while ((c = getopt(argc, argv, "hqblcnRrsviyw")) != -1)
 		switch (c) {
 		case 'h':
 			hflag++;
+			break;
+		case 'q':	/* POSIX: quiet: status only */
+			qflag++;
 			break;
 		case 'v':
 			vflag++;
@@ -126,6 +139,12 @@ main(int argc, char **argv)
 			break;
 		case 'n':
 			nflag++;
+			break;
+		case 'R':
+			Rflag++;
+			/* FALLTHROUGH */
+		case 'r':
+			rflag++;
 			break;
 		case 'b':
 			bflag++;
@@ -148,7 +167,8 @@ main(int argc, char **argv)
 		}
 
 	if (errflg || (optind >= argc)) {
-		errmsg("Usage: grep -hblcnsviw pattern file . . .\n",
+		errmsg("Usage: grep [-c|-l|-q] [-r|-R] -hbnsviw "
+		    "pattern file . . .\n",
 		    (char *)NULL);
 		exit(2);
 	}
@@ -186,16 +206,80 @@ main(int argc, char **argv)
 		regerr(regerrno);
 
 	if (--argc == 0)
-		execute(NULL);
+		execute(NULL, 0);
 	else
 		while (argc-- > 0)
-			execute(*++argv);
+			prepare(*++argv);
 
 	return (nsucc == 2 ? 2 : (nsucc == 0 ? 1 : 0));
 }
 
 static void
-execute(char *file)
+prepare(const char *path)
+{
+	struct	stat st;
+	int	walkflags = FTW_CHDIR;
+	char	*buf = NULL;
+
+	if (rflag) {
+		if (stat(path, &st) != -1 &&
+		    (st.st_mode & S_IFMT) == S_IFDIR) {
+			outfn = 1;
+
+			/*
+			 * Add trailing slash if arg
+			 * is directory, to resolve symlinks.
+			 */
+			if (path[strlen(path) - 1] != '/') {
+				(void) asprintf(&buf, "%s/", path);
+				if (buf != NULL)
+					path = buf;
+			}
+
+			/*
+			 * Search through subdirs if path is directory.
+			 * Don't follow symlinks if Rflag is not set.
+			 */
+			if (!Rflag)
+				walkflags |= FTW_PHYS;
+
+			if (nftw(path, recursive, MAX_DEPTH, walkflags) != 0) {
+				if (!sflag)
+					errmsg("grep: can't open %s\n", path);
+				nsucc = 2;
+			}
+			return;
+		}
+	}
+	execute(path, 0);
+}
+
+static int
+recursive(const char *name, const struct stat *statp, int info, struct FTW *ftw)
+{
+	/*
+	 * process files and follow symlinks if Rflag set.
+	 */
+	if (info != FTW_F) {
+		if (!sflag &&
+		    (info == FTW_SLN || info == FTW_DNR || info == FTW_NS)) {
+			/* report broken symlinks and unreadable files */
+			errmsg("grep: can't open %s\n", name);
+		}
+		return (0);
+	}
+
+	/* skip devices and pipes if Rflag is not set */
+	if (!Rflag && !S_ISREG(statp->st_mode))
+		return (0);
+
+	/* pass offset to relative name from FTW_CHDIR */
+	execute(name, ftw->base);
+	return (0);
+}
+
+static void
+execute(const char *file, int base)
 {
 	char	*lbuf, *p;
 	long	count;
@@ -217,7 +301,7 @@ execute(char *file)
 
 	if (file == NULL)
 		temp = 0;
-	else if ((temp = open(file, O_RDONLY)) == -1) {
+	else if ((temp = open(file + base, O_RDONLY)) == -1) {
 		if (!sflag)
 			errmsg("grep: can't open %s\n", file);
 		nsucc = 2;
@@ -228,9 +312,10 @@ execute(char *file)
 	if ((count = read(temp, prntbuf, GBUFSIZ)) <= 0) {
 		(void) close(temp);
 
-		if (cflag) {
+		if (cflag && !qflag) {
 			if (nfile > 1 && !hflag && file)
 				(void) fprintf(stdout, "%s:", file);
+			if (!rflag)
 			(void) fprintf(stdout, "%lld\n", tln);
 		}
 		return;
@@ -324,21 +409,27 @@ execute(char *file)
 	}
 	(void) close(temp);
 
-	if (cflag) {
-		if (nfile > 1 && !hflag && file)
+	if (cflag && !qflag) {
+		if (!hflag && file && (nfile > 1 ||
+		    (rflag && outfn)))
 			(void) fprintf(stdout, "%s:", file);
 		(void) fprintf(stdout, "%lld\n", tln);
 	}
 }
 
 static int
-succeed(char *f)
+succeed(const char *f)
 {
 	int nchars;
 	nsucc = (nsucc == 2) ? 2 : 1;
 
 	if (f == NULL)
 		f = "<stdin>";
+
+	if (qflag) {
+		/* no need to continue */
+		return (1);
+	}
 
 	if (cflag) {
 		tln++;
@@ -350,9 +441,10 @@ succeed(char *f)
 		return (1);
 	}
 
-	if (nfile > 1 && !hflag)
+	if (!hflag && (nfile > 1 || (rflag && outfn))) {
 		/* print filename */
 		(void) fprintf(stdout, "%s:", f);
+	}
 
 	if (bflag)
 		/* print block number */

@@ -20,6 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 /* Portions Copyright 2010 Robert Milkowski */
@@ -137,31 +138,20 @@ void dmu_objset_rele(objset_t *os, void *tag);
 void dmu_objset_disown(objset_t *os, void *tag);
 int dmu_objset_from_ds(struct dsl_dataset *ds, objset_t **osp);
 
-int dmu_objset_create(const char *name, dmu_objset_type_t type, uint64_t flags,
-    void (*func)(objset_t *os, void *arg, cred_t *cr, dmu_tx_t *tx), void *arg);
-int dmu_objset_clone(const char *name, struct dsl_dataset *clone_origin,
-    uint64_t flags);
-int dmu_objset_destroy(const char *name, boolean_t defer);
-int dmu_objset_snapshot(char *fsname, char *snapname, char *tag,
-    struct nvlist *props, boolean_t recursive, boolean_t temporary, int fd);
 void dmu_objset_stats(objset_t *os, nvlist_t *nv);
 void dmu_objset_fast_stat(objset_t *os, dmu_objset_stats_t *stat);
 void dmu_objset_space(objset_t *os, uint64_t *refdbytesp, uint64_t *availbytesp,
     uint64_t *usedobjsp, uint64_t *availobjsp);
 uint64_t dmu_objset_fsid_guid(objset_t *os);
-int dmu_objset_find(char *name, int func(const char *, void *), void *arg,
-    int flags);
 int dmu_objset_find_spa(spa_t *spa, const char *name,
     int func(spa_t *, uint64_t, const char *, void *), void *arg, int flags);
 int dmu_objset_prefetch(const char *name, void *arg);
-void dmu_objset_byteswap(void *buf, size_t size);
 int dmu_objset_evict_dbufs(objset_t *os);
 timestruc_t dmu_objset_snap_cmtime(objset_t *os);
 
 /* called from dsl */
 void dmu_objset_sync(objset_t *os, zio_t *zio, dmu_tx_t *tx);
 boolean_t dmu_objset_is_dirty(objset_t *os, uint64_t txg);
-boolean_t dmu_objset_is_dirty_anywhere(objset_t *os);
 objset_t *dmu_objset_create_impl(spa_t *spa, struct dsl_dataset *ds,
     blkptr_t *bp, dmu_objset_type_t type, dmu_tx_t *tx);
 int dmu_objset_open_impl(spa_t *spa, struct dsl_dataset *ds, blkptr_t *bp,

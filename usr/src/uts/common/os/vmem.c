@@ -24,6 +24,11 @@
  */
 
 /*
+ * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright (c) 2012, Joyent, Inc. All rights reserved.
+ */
+
+/*
  * Big Theory Statement for the virtual memory allocator.
  *
  * For a more complete description of the main ideas, see:
@@ -1061,6 +1066,21 @@ do_alloc:
 			aneeded = MAX(size + aphase, vmp->vm_min_import);
 			asize = P2ROUNDUP(aneeded, aquantum);
 
+			if (asize < size) {
+				/*
+				 * The rounding induced overflow; return NULL
+				 * if we are permitted to fail the allocation
+				 * (and explicitly panic if we aren't).
+				 */
+				if ((vmflag & VM_NOSLEEP) &&
+				    !(vmflag & VM_PANIC)) {
+					mutex_exit(&vmp->vm_lock);
+					return (NULL);
+				}
+
+				panic("vmem_xalloc(): size overflow");
+			}
+
 			/*
 			 * Determine how many segment structures we'll consume.
 			 * The calculation must be precise because if we're
@@ -1704,6 +1724,19 @@ vmem_update(void *dummy)
 	mutex_exit(&vmem_list_lock);
 
 	(void) timeout(vmem_update, dummy, vmem_update_interval * hz);
+}
+
+void
+vmem_qcache_reap(vmem_t *vmp)
+{
+	int i;
+
+	/*
+	 * Reap any quantum caches that may be part of this vmem.
+	 */
+	for (i = 0; i < VMEM_NQCACHE_MAX; i++)
+		if (vmp->vm_qcache[i])
+			kmem_cache_reap_now(vmp->vm_qcache[i]);
 }
 
 /*

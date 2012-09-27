@@ -23,6 +23,10 @@
 # Use is subject to license terms.
 #
 
+#
+# Copyright (c) 2012 by Delphix. All rights reserved.
+#
+
 PROG = isns
 
 DSRC = isns_provider.d
@@ -54,6 +58,11 @@ LINTFLAGS += -xerroff=E_BAD_PTR_CAST_ALIGN
 LINTFLAGS += -xerroff=E_NAME_USED_NOT_DEF2
 LINTFLAGS += -xerroff=E_CASE_FALLTHRU
 
+CERRWARN += -_gcc=-Wno-char-subscripts
+CERRWARN += -_gcc=-Wno-ignored-qualifiers
+CERRWARN += -_gcc=-Wno-uninitialized
+CERRWARN += -_gcc=-Wno-implicit-function-declaration
+
 obj.o := CERRWARN += -erroff=E_CONST_OBJ_SHOULD_HAVE_INITIZR
 obj.o := CERRWARN += -erroff=E_IMPLICIT_DECL_FUNC_RETURN_INT
 
@@ -68,14 +77,14 @@ $(PROG): $(OBJS)
 	$(POST_PROCESS)
 
 %.h: %.d
-	$(DTRACE) -xnolibs -h -s $< -o $@
+	$(DTRACE) -h -s $< -o $@
 
 %.o:	%.c $(DTRACE_HEADER)
 	$(COMPILE.c) $<
 	$(POST_PROCESS_O)
 
 %.o:	%.d $(COBJS)
-	$(COMPILE.d) -xnolibs -s $< $(COBJS)
+	$(COMPILE.d) -s $< $(COBJS)
 	$(POST_PROCESS_O)
 
 clean:

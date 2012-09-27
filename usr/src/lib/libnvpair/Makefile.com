@@ -22,7 +22,7 @@
 # Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
 #
-# ident	"%Z%%M%	%I%	%E% SMI"
+# Copyright (c) 2012 by Delphix. All rights reserved.
 #
 
 LIBRARY=	libnvpair.a
@@ -31,7 +31,8 @@ VERS=		.1
 OBJECTS=	libnvpair.o \
 		nvpair_alloc_system.o \
 		nvpair_alloc_fixed.o \
-		nvpair.o
+		nvpair.o \
+		fnvpair.o
 
 include ../../Makefile.lib
 include ../../Makefile.rootfs
@@ -39,7 +40,8 @@ include ../../Makefile.rootfs
 SRCS=		../libnvpair.c \
 		../nvpair_alloc_system.c \
 		$(SRC)/common/nvpair/nvpair_alloc_fixed.c \
-		$(SRC)/common/nvpair/nvpair.c
+		$(SRC)/common/nvpair/nvpair.c \
+		$(SRC)/common/nvpair/fnvpair.c
 
 #
 # Libraries added to the next line must be present in miniroot
@@ -53,6 +55,10 @@ LINTFLAGS64 +=	-erroff=E_BAD_PTR_CAST_ALIGN
 # turn off warning caused by lint bug: not understanding SCNi8 "hhi"
 LINTFLAGS +=	-erroff=E_BAD_FORMAT_STR2
 LINTFLAGS64 +=	-erroff=E_BAD_FORMAT_STR2
+
+CERRWARN +=	-_gcc=-Wno-type-limits
+CERRWARN +=	-_gcc=-Wno-parentheses
+CERRWARN +=	-_gcc=-Wno-uninitialized
 
 CFLAGS +=	$(CCVERBOSE)
 CPPFLAGS +=	-D_REENTRANT

@@ -133,7 +133,7 @@
     newSVnv((NVTYPE) (V / 1000000000.0))
 
 #define	SAVE_FNP(H, F, K) \
-    hv_store(H, K, sizeof (K) - 1, newSViv((IVTYPE) &F), 0)
+    hv_store(H, K, sizeof (K) - 1, newSViv((IVTYPE)(uintptr_t)&F), 0)
 #define	SAVE_STRING(H, S, K, SS) \
     hv_store(H, #K, sizeof (#K) - 1, \
     newSVpvn(S->K, SS ? strlen(S->K) : sizeof(S->K)), 0)
@@ -950,7 +950,7 @@ set_valid(HV *self, void *arg)
 
 	mg = mg_find((SV *)self, '~');
 	PERL_ASSERTMSG(mg != 0, "set_valid: lost ~ magic");
-	((KstatInfo_t *)SvPVX(mg->mg_obj))->valid = (int)arg;
+	((KstatInfo_t *)SvPVX(mg->mg_obj))->valid = (int)(intptr_t)arg;
 	return (1);
 }
 

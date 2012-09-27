@@ -21,10 +21,10 @@
 # CDDL HEADER END
 #
 #
+# Copyright 2012 Nexenta Sysytems, Inc.  All rights reserved.
 # Copyright 2005 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
 #
-#ident	"%Z%%M%	%I%	%E% SMI"
 
 PATH=/sbin:/usr/bin:/usr/sbin
 LC_ALL=C
@@ -37,7 +37,7 @@ usage()
 {
 	echo "usage: $0 [-r rootdir]" >&2
 	echo "
-See http://sun.com/msg/SMF-8000-MY for more information on the use of
+See http://illumos.org/msg/SMF-8000-MY for more information on the use of
 this script."
 	exit 2;
 }
@@ -86,13 +86,13 @@ if [ -x /usr/bin/id -a -x /usr/bin/grep ] &&
 fi
 
 echo >&2 "
-See http://sun.com/msg/SMF-8000-MY for more information on the use of
+See http://illumos.org/msg/SMF-8000-MY for more information on the use of
 this script to restore backup copies of the smf(5) repository.
 
 If there are any problems which need human intervention, this script will
 give instructions and then exit back to your shell."
 
-if [ "$myroot" -eq / ]; then
+if [ "$myroot" = "/" ]; then
 	system="system"
 	[ "`/sbin/zonename`" != global ] && system="zone"
 	echo >&2 "

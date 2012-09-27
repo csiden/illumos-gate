@@ -67,7 +67,7 @@ i386_LDEVINFO=
 LDEVINFO=	-ldevinfo
 
 DAEMON_LDLIBS =	$(LDLIBS.cmd) -lkstat $(LDEVINFO)
-PMCFG_LDLIBS =	$(LDLIBS.cmd) -lcmd -lsmbios -lkstat $($(MACH)_LDEVINFO)
+PMCFG_LDLIBS =	$(LDLIBS.cmd) -lsmbios -lkstat $($(MACH)_LDEVINFO)
 SUSPEND_LDLIBS = $(LDLIBS.cmd) -lbsm -lpam -lsecdb
 
 ROOTUSRSBINPMCFG= $(PMCFG:%=$(ROOTUSRSBIN)/%)
@@ -90,6 +90,9 @@ $(ROOTUSRSBINSYSIDPM) := FILEMODE= 755
 # lint pass one enforcement
 #
 CFLAGS += $(CCVERBOSE)
+CERRWARN += -_gcc=-Wno-parentheses
+CERRWARN += -_gcc=-Wno-uninitialized
+CERRWARN += -_gcc=-Wno-unused-value
 
 .PARALLEL: $(OBJS)
 

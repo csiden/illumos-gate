@@ -21,6 +21,8 @@
 
 /*
  * Copyright (c) 1990, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright 2012 Garrett D'Amore <garrett@damore.org>.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 #ifndef	_SYS_SUNDDI_H
@@ -459,6 +461,7 @@ extern char *strncat(char *, const char *, size_t);
 extern size_t strlcat(char *, const char *, size_t);
 extern size_t strlcpy(char *, const char *, size_t);
 extern size_t strspn(const char *, const char *);
+extern size_t strcspn(const char *, const char *);
 extern int bcmp(const void *, const void *, size_t) __PURE;
 extern int stoi(char **);
 extern void numtos(ulong_t, char *);
@@ -1733,10 +1736,6 @@ ddi_ctlops(dev_info_t *d, dev_info_t *r, ddi_ctl_enum_t o, void *a, void *v);
 /*
  * bus_dma_map wrapper
  */
-
-int
-ddi_dma_map(dev_info_t *dip, dev_info_t *rdip,
-	struct ddi_dma_req *dmareqp, ddi_dma_handle_t *handlep);
 
 int
 ddi_dma_allochdl(dev_info_t *dip, dev_info_t *rdip, ddi_dma_attr_t *attr,

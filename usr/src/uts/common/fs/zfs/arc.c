@@ -21,7 +21,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
- * Copyright (c) 2011 by Delphix. All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 /*
@@ -80,9 +80,9 @@
  * types of locks: 1) the hash table lock array, and 2) the
  * arc list locks.
  *
- * Buffers do not have their own mutexs, rather they rely on the
- * hash table mutexs for the bulk of their protection (i.e. most
- * fields in the arc_buf_hdr_t are protected by these mutexs).
+ * Buffers do not have their own mutexes, rather they rely on the
+ * hash table mutexes for the bulk of their protection (i.e. most
+ * fields in the arc_buf_hdr_t are protected by these mutexes).
  *
  * buf_hash_find() returns the appropriate mutex (held) when it
  * locates the requested buffer in the hash table.  It returns
@@ -134,6 +134,12 @@
 #include <sys/callb.h>
 #include <sys/kstat.h>
 #include <zfs_fletcher.h>
+
+#ifndef _KERNEL
+/* set with ZFS_DEBUG=watch, to enable watchpoints on frozen buffers */
+boolean_t arc_watch = B_FALSE;
+int arc_procfd;
+#endif
 
 static kmutex_t		arc_reclaim_thr_lock;
 static kcondvar_t	arc_reclaim_thr_cv;	/* used to signal reclaim thr */
@@ -474,6 +480,7 @@ static void arc_get_data_buf(arc_buf_t *buf);
 static void arc_access(arc_buf_hdr_t *buf, kmutex_t *hash_lock);
 static int arc_evict_needed(arc_buf_contents_t type);
 static void arc_evict_ghost(arc_state_t *state, uint64_t spa, int64_t bytes);
+static void arc_buf_watch(arc_buf_t *buf);
 
 static boolean_t l2arc_write_eligible(uint64_t spa_guid, arc_buf_hdr_t *ab);
 
@@ -949,6 +956,50 @@ arc_cksum_compute(arc_buf_t *buf, boolean_t force)
 	fletcher_2_native(buf->b_data, buf->b_hdr->b_size,
 	    buf->b_hdr->b_freeze_cksum);
 	mutex_exit(&buf->b_hdr->b_freeze_lock);
+	arc_buf_watch(buf);
+}
+
+#ifndef _KERNEL
+typedef struct procctl {
+	long cmd;
+	prwatch_t prwatch;
+} procctl_t;
+#endif
+
+/* ARGSUSED */
+static void
+arc_buf_unwatch(arc_buf_t *buf)
+{
+#ifndef _KERNEL
+	if (arc_watch) {
+		int result;
+		procctl_t ctl;
+		ctl.cmd = PCWATCH;
+		ctl.prwatch.pr_vaddr = (uintptr_t)buf->b_data;
+		ctl.prwatch.pr_size = 0;
+		ctl.prwatch.pr_wflags = 0;
+		result = write(arc_procfd, &ctl, sizeof (ctl));
+		ASSERT3U(result, ==, sizeof (ctl));
+	}
+#endif
+}
+
+/* ARGSUSED */
+static void
+arc_buf_watch(arc_buf_t *buf)
+{
+#ifndef _KERNEL
+	if (arc_watch) {
+		int result;
+		procctl_t ctl;
+		ctl.cmd = PCWATCH;
+		ctl.prwatch.pr_vaddr = (uintptr_t)buf->b_data;
+		ctl.prwatch.pr_size = buf->b_hdr->b_size;
+		ctl.prwatch.pr_wflags = WA_WRITE;
+		result = write(arc_procfd, &ctl, sizeof (ctl));
+		ASSERT3U(result, ==, sizeof (ctl));
+	}
+#endif
 }
 
 void
@@ -975,6 +1026,8 @@ arc_buf_thaw(arc_buf_t *buf)
 	}
 
 	mutex_exit(&buf->b_hdr->b_freeze_lock);
+
+	arc_buf_unwatch(buf);
 }
 
 void
@@ -992,6 +1045,7 @@ arc_buf_freeze(arc_buf_t *buf)
 	    buf->b_hdr->b_state == arc_anon);
 	arc_cksum_compute(buf, B_FALSE);
 	mutex_exit(hash_lock);
+
 }
 
 static void
@@ -1010,7 +1064,7 @@ add_reference(arc_buf_hdr_t *ab, kmutex_t *hash_lock, void *tag)
 		ASSERT(list_link_active(&ab->b_arc_node));
 		list_remove(list, ab);
 		if (GHOST_STATE(ab->b_state)) {
-			ASSERT3U(ab->b_datacnt, ==, 0);
+			ASSERT0(ab->b_datacnt);
 			ASSERT3P(ab->b_buf, ==, NULL);
 			delta = ab->b_size;
 		}
@@ -1348,21 +1402,22 @@ arc_buf_add_ref(arc_buf_t *buf, void* tag)
  * the buffer is placed on l2arc_free_on_write to be freed later.
  */
 static void
-arc_buf_data_free(arc_buf_hdr_t *hdr, void (*free_func)(void *, size_t),
-    void *data, size_t size)
+arc_buf_data_free(arc_buf_t *buf, void (*free_func)(void *, size_t))
 {
+	arc_buf_hdr_t *hdr = buf->b_hdr;
+
 	if (HDR_L2_WRITING(hdr)) {
 		l2arc_data_free_t *df;
 		df = kmem_alloc(sizeof (l2arc_data_free_t), KM_SLEEP);
-		df->l2df_data = data;
-		df->l2df_size = size;
+		df->l2df_data = buf->b_data;
+		df->l2df_size = hdr->b_size;
 		df->l2df_func = free_func;
 		mutex_enter(&l2arc_free_on_write_mtx);
 		list_insert_head(l2arc_free_on_write, df);
 		mutex_exit(&l2arc_free_on_write_mtx);
 		ARCSTAT_BUMP(arcstat_l2_free_on_write);
 	} else {
-		free_func(data, size);
+		free_func(buf->b_data, hdr->b_size);
 	}
 }
 
@@ -1378,16 +1433,15 @@ arc_buf_destroy(arc_buf_t *buf, boolean_t recycle, boolean_t all)
 		arc_buf_contents_t type = buf->b_hdr->b_type;
 
 		arc_cksum_verify(buf);
+		arc_buf_unwatch(buf);
 
 		if (!recycle) {
 			if (type == ARC_BUFC_METADATA) {
-				arc_buf_data_free(buf->b_hdr, zio_buf_free,
-				    buf->b_data, size);
+				arc_buf_data_free(buf, zio_buf_free);
 				arc_space_return(size, ARC_SPACE_DATA);
 			} else {
 				ASSERT(type == ARC_BUFC_DATA);
-				arc_buf_data_free(buf->b_hdr,
-				    zio_data_buf_free, buf->b_data, size);
+				arc_buf_data_free(buf, zio_data_buf_free);
 				ARCSTAT_INCR(arcstat_data_size, -size);
 				atomic_add_64(&arc_size, -size);
 			}
@@ -1637,7 +1691,7 @@ arc_evict(arc_state_t *state, uint64_t spa, int64_t bytes, boolean_t recycle,
 		hash_lock = HDR_LOCK(ab);
 		have_lock = MUTEX_HELD(hash_lock);
 		if (have_lock || mutex_tryenter(hash_lock)) {
-			ASSERT3U(refcount_count(&ab->b_refcnt), ==, 0);
+			ASSERT0(refcount_count(&ab->b_refcnt));
 			ASSERT(ab->b_datacnt > 0);
 			while (ab->b_buf) {
 				arc_buf_t *buf = ab->b_buf;
@@ -1982,6 +2036,11 @@ arc_shrink(void)
 		arc_adjust();
 }
 
+/*
+ * Determine if the system is under memory pressure and is asking
+ * to reclaim memory. A return value of 1 indicates that the system
+ * is under memory pressure and that the arc should adjust accordingly.
+ */
 static int
 arc_reclaim_needed(void)
 {
@@ -2029,11 +2088,24 @@ arc_reclaim_needed(void)
 	 * heap is allocated.  (Or, in the calculation, if less than 1/4th is
 	 * free)
 	 */
-	if (btop(vmem_size(heap_arena, VMEM_FREE)) <
-	    (btop(vmem_size(heap_arena, VMEM_FREE | VMEM_ALLOC)) >> 2))
+	if (vmem_size(heap_arena, VMEM_FREE) <
+	    (vmem_size(heap_arena, VMEM_FREE | VMEM_ALLOC) >> 2))
 		return (1);
 #endif
 
+	/*
+	 * If zio data pages are being allocated out of a separate heap segment,
+	 * then enforce that the size of available vmem for this arena remains
+	 * above about 1/16th free.
+	 *
+	 * Note: The 1/16th arena free requirement was put in place
+	 * to aggressively evict memory from the arc in order to avoid
+	 * memory fragmentation issues.
+	 */
+	if (zio_arena != NULL &&
+	    vmem_size(zio_arena, VMEM_FREE) <
+	    (vmem_size(zio_arena, VMEM_ALLOC) >> 4))
+		return (1);
 #else
 	if (spa_get_random(100) == 0)
 		return (1);
@@ -2085,6 +2157,13 @@ arc_kmem_reap_now(arc_reclaim_strategy_t strat)
 	}
 	kmem_cache_reap_now(buf_cache);
 	kmem_cache_reap_now(hdr_cache);
+
+	/*
+	 * Ask the vmem areana to reclaim unused memory from its
+	 * quantum caches.
+	 */
+	if (zio_arena != NULL && strat == ARC_RECLAIM_AGGR)
+		vmem_qcache_reap(zio_arena);
 }
 
 static void
@@ -2217,18 +2296,6 @@ arc_evict_needed(arc_buf_contents_t type)
 {
 	if (type == ARC_BUFC_METADATA && arc_meta_used >= arc_meta_limit)
 		return (1);
-
-#ifdef _KERNEL
-	/*
-	 * If zio data pages are being allocated out of a separate heap segment,
-	 * then enforce that the size of available vmem for this area remains
-	 * above about 1/32nd free.
-	 */
-	if (type == ARC_BUFC_DATA && zio_arena != NULL &&
-	    vmem_size(zio_arena, VMEM_FREE) <
-	    (vmem_size(zio_arena, VMEM_ALLOC) >> 5))
-		return (1);
-#endif
 
 	if (arc_reclaim_needed())
 		return (1);
@@ -2452,7 +2519,7 @@ arc_access(arc_buf_hdr_t *buf, kmutex_t *hash_lock)
 			 * This is a prefetch access...
 			 * move this block back to the MRU state.
 			 */
-			ASSERT3U(refcount_count(&buf->b_refcnt), ==, 0);
+			ASSERT0(refcount_count(&buf->b_refcnt));
 			new_state = arc_mru;
 		}
 
@@ -2534,13 +2601,16 @@ arc_read_done(zio_t *zio)
 	callback_list = hdr->b_acb;
 	ASSERT(callback_list != NULL);
 	if (BP_SHOULD_BYTESWAP(zio->io_bp) && zio->io_error == 0) {
+		dmu_object_byteswap_t bswap =
+		    DMU_OT_BYTESWAP(BP_GET_TYPE(zio->io_bp));
 		arc_byteswap_func_t *func = BP_GET_LEVEL(zio->io_bp) > 0 ?
 		    byteswap_uint64_array :
-		    dmu_ot[BP_GET_TYPE(zio->io_bp)].ot_byteswap;
+		    dmu_ot_byteswap[bswap].ob_func;
 		func(buf->b_data, hdr->b_size);
 	}
 
 	arc_cksum_compute(buf, B_FALSE);
+	arc_buf_watch(buf);
 
 	if (hash_lock && zio->io_error == 0 && hdr->b_state == arc_anon) {
 		/*
@@ -2621,7 +2691,7 @@ arc_read_done(zio_t *zio)
 }
 
 /*
- * "Read" the block block at the specified DVA (in bp) via the
+ * "Read" the block at the specified DVA (in bp) via the
  * cache.  If the block is found in the cache, invoke the provided
  * callback immediately and return.  Note that the `zio' parameter
  * in the callback will be NULL in this case, since no IO was
@@ -2791,7 +2861,7 @@ top:
 			/* this block is in the ghost cache */
 			ASSERT(GHOST_STATE(hdr->b_state));
 			ASSERT(!HDR_IO_IN_PROGRESS(hdr));
-			ASSERT3U(refcount_count(&hdr->b_refcnt), ==, 0);
+			ASSERT0(refcount_count(&hdr->b_refcnt));
 			ASSERT(hdr->b_buf == NULL);
 
 			/* if this is a prefetch, we don't have a reference */
@@ -3098,6 +3168,7 @@ arc_release(arc_buf_t *buf, void *tag)
 		}
 		hdr->b_datacnt -= 1;
 		arc_cksum_verify(buf);
+		arc_buf_unwatch(buf);
 
 		mutex_exit(hash_lock);
 
@@ -4365,7 +4436,7 @@ l2arc_write_buffers(spa_t *spa, l2arc_dev_t *dev, uint64_t target_sz)
 	mutex_exit(&l2arc_buflist_mtx);
 
 	if (pio == NULL) {
-		ASSERT3U(write_sz, ==, 0);
+		ASSERT0(write_sz);
 		kmem_cache_free(hdr_cache, head);
 		return (0);
 	}

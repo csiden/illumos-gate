@@ -22,6 +22,9 @@
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
+/*
+ * Copyright 2012 Nexenta Systems, Inc. All rights reserved.
+ */
 
 /*
  *  	Copyright (c) 1983,1984,1985,1986,1987,1988,1989  AT&T.
@@ -713,33 +716,33 @@ utf8_compare(const utf8string *a, const utf8string *b)
 /*
  * utf8_dir_verify - checks that the utf8 string is valid
  */
-int
+nfsstat4
 utf8_dir_verify(utf8string *str)
 {
 	char *nm;
 	int len;
 
 	if (str == NULL)
-		return (0);
+		return (NFS4ERR_INVAL);
 
 	nm = str->utf8string_val;
 	len = str->utf8string_len;
 	if (nm == NULL || len == 0) {
-		return (0);
+		return (NFS4ERR_INVAL);
 	}
 
 	if (len == 1 && nm[0] == '.')
-		return (0);
+		return (NFS4ERR_BADNAME);
 	if (len == 2 && nm[0] == '.' && nm[1] == '.')
-		return (0);
+		return (NFS4ERR_BADNAME);
 
 	if (utf8_strchr(str, '/') != NULL)
-		return (0);
+		return (NFS4ERR_BADNAME);
 
 	if (utf8_strchr(str, '\0') != NULL)
-		return (0);
+		return (NFS4ERR_BADNAME);
 
-	return (1);
+	return (NFS4_OK);
 }
 
 /*
@@ -2110,8 +2113,10 @@ recov_retry:
 			goto out;
 		}
 	}
-	va.va_type = VNON;
-	pva.va_type = VNON;
+
+	pgar.n4g_va.va_type = VNON;
+	gar.n4g_va.va_type = VNON;
+
 	remap_lookup(np, rootvp, RML_ORDINARY, cr,
 	    &newfh, &gar, &newpfh, &pgar, &e);
 	if (nfs4_needs_recovery(&e, FALSE, mi->mi_vfsp)) {
@@ -2137,10 +2142,8 @@ recov_retry:
 		goto out;
 	}
 
-	if (!e.error) {
-		va = gar.n4g_va;
-		pva = pgar.n4g_va;
-	}
+	va = gar.n4g_va;
+	pva = pgar.n4g_va;
 
 	if ((e.error != 0) ||
 	    (va.va_type != VDIR)) {
@@ -2173,6 +2176,13 @@ recov_retry:
 		if (pnp != NULL) {
 			remap_lookup(pnp, rootvp, RML_ORDINARY, cr,
 			    &newpfh, &pgar, NULL, NULL, &e);
+			/*
+			 * This remap_lookup call modifies pgar. The following
+			 * line prevents trouble when checking the va_type of
+			 * pva later in this code.
+			 */
+			pva = pgar.n4g_va;
+
 			if (nfs4_needs_recovery(&e, FALSE,
 			    mi->mi_vfsp)) {
 				if (need_start_op) {

@@ -1,4 +1,5 @@
 '\" te
+.\" Copyright 2012 Nexenta Systems, Inc. All rights reserved.
 .\" Copyright 1989 AT&T
 .\" Copyright (c) 2008, Sun Microsystems, Inc.  All Rights Reserved
 .\" Portions Copyright (c) 1992, X/Open Company Limited  All Rights Reserved
@@ -15,26 +16,28 @@ grep \- search a file for a pattern
 .SH SYNOPSIS
 .LP
 .nf
-\fB/usr/bin/grep\fR [\fB-bchilnsvw\fR] \fIlimited-regular-expression\fR
-     [\fIfilename\fR]...
+\fB/usr/bin/grep\fR [\fB-c\fR | \fB-l\fR |\fB-q\fR] [\fB-r\fR | \fB-R\fR] [\fB-bhinsvw\fR]
+    \fIlimited-regular-expression\fR [\fIfilename\fR]...
 .fi
 
 .LP
 .nf
-\fB/usr/xpg4/bin/grep\fR [\fB-E\fR | \fB-F\fR] [\fB-c\fR | \fB-l\fR | \fB-q\fR] [\fB-bhinsvwx\fR] \fB-e\fR \fIpattern_list\fR...
-     [\fB-f\fR \fIpattern_file\fR]... [\fIfile\fR]...
+\fB/usr/xpg4/bin/grep\fR [\fB-E\fR | \fB-F\fR] [\fB-c\fR | \fB-l\fR | \fB-q\fR] [\fB-r\fR | \fB-R\fR]
+    [\fB-bhinsvwx\fR] \fB-e\fR \fIpattern_list\fR... [\fB-f\fR \fIpattern_file\fR]...
+    [\fIfile\fR]...
 .fi
 
 .LP
 .nf
-\fB/usr/xpg4/bin/grep\fR [\fB-E\fR | \fB-F\fR] [\fB-c\fR | \fB-l\fR | \fB-q\fR] [\fB-bhinsvwx\fR]
-     [\fB-e\fR \fIpattern_list\fR]... \fB-f\fR \fIpattern_file\fR... [\fIfile\fR]...
+\fB/usr/xpg4/bin/grep\fR [\fB-E\fR | \fB-F\fR] [\fB-c\fR | \fB-l\fR | \fB-q\fR] [\fB-r\fR | \fB-R\fR]
+    [\fB-bhinsvwx\fR] [\fB-e\fR \fIpattern_list\fR]... \fB-f\fR \fIpattern_file\fR...
+    [\fIfile\fR]...
 .fi
 
 .LP
 .nf
-\fB/usr/xpg4/bin/grep\fR [\fB-E\fR | \fB-F\fR] [\fB-c\fR | \fB-l\fR | \fB-q\fR] [\fB-bhinsvwx\fR] \fIpattern\fR
-     [\fIfile\fR]...
+\fB/usr/xpg4/bin/grep\fR [\fB-E\fR | \fB-F\fR] [\fB-c\fR | \fB-l\fR | \fB-q\fR] [\fB-r\fR | \fB-R\fR]
+    [\fB-bhinsvwx\fR] \fIpattern\fR [\fIfile\fR]...
 .fi
 
 .SH DESCRIPTION
@@ -129,6 +132,36 @@ than once.
 .ad
 .RS 6n
 Precedes each line by its line number in the file (first line is 1).
+.RE
+
+.sp
+.ne 2
+.na
+\fB\fB-r\fR\fR
+.ad
+.RS 6n
+Read all files under each directory, recursively. Follow symbolic links on
+the command line, but skip symlinks that are encountered recursively. If file
+is a device, FIFO, or socket, skip it.
+.RE
+
+.sp
+.ne 2
+.na
+\fB\fB-R\fR\fR
+.ad
+.RS 6n
+Read all files under each directory, recursively, following all symbolic links.
+.RE
+
+.sp
+.ne 2
+.na
+\fB\fB-q\fR\fR
+.ad
+.RS 6n
+Quiet. Does not write anything to the standard output, regardless of matching
+lines. Exits with zero status if an input line is selected.
 .RE
 
 .sp
@@ -241,16 +274,6 @@ Matches using fixed strings. Treats each pattern specified as a string instead
 of a regular expression. If an input line contains any of the patterns as a
 contiguous sequence of bytes, the line is matched. A null string matches every
 line. See \fBfgrep\fR(1) for more information.
-.RE
-
-.sp
-.ne 2
-.na
-\fB\fB-q\fR\fR
-.ad
-.RS 19n
-Quiet. Does not write anything to the standard output, regardless of matching
-lines. Exits with zero status if an input line is selected.
 .RE
 
 .sp

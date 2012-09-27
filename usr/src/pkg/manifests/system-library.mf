@@ -334,7 +334,6 @@ file path=usr/lib/$(ARCH64)/libipp.so.1
 file path=usr/lib/$(ARCH64)/libipsecutil.so.1
 file path=usr/lib/$(ARCH64)/libkvm.so.1
 file path=usr/lib/$(ARCH64)/libl.so.1
-file path=usr/lib/$(ARCH64)/libldap.so.4
 file path=usr/lib/$(ARCH64)/libldap.so.5
 file path=usr/lib/$(ARCH64)/liblgrp.so.1
 file path=usr/lib/$(ARCH64)/liblm.so.1
@@ -405,7 +404,6 @@ file path=usr/lib/libipp.so.1
 file path=usr/lib/libipsecutil.so.1
 file path=usr/lib/libkvm.so.1
 file path=usr/lib/libl.so.1
-file path=usr/lib/libldap.so.4
 file path=usr/lib/libldap.so.5
 file path=usr/lib/liblgrp.so.1
 file path=usr/lib/liblm.so.1
@@ -530,6 +528,9 @@ license cr_Sun license=cr_Sun
 license lic_CDDL license=lic_CDDL
 license lic_OSBL license=lic_OSBL
 license lic_OSBL_preamble license=lic_OSBL_preamble
+# libwrap is part of tcp wrappers along with tcpd
+license usr/src/cmd/tcpd/THIRDPARTYLICENSE \
+    license=usr/src/cmd/tcpd/THIRDPARTYLICENSE
 license usr/src/common/crypto/THIRDPARTYLICENSE.cryptogams \
     license=usr/src/common/crypto/THIRDPARTYLICENSE.cryptogams
 license usr/src/common/crypto/aes/amd64/THIRDPARTYLICENSE.gladman \
@@ -556,8 +557,6 @@ license usr/src/lib/libinetutil/common/THIRDPARTYLICENSE \
     license=usr/src/lib/libinetutil/common/THIRDPARTYLICENSE
 license usr/src/lib/libkmf/THIRDPARTYLICENSE \
     license=usr/src/lib/libkmf/THIRDPARTYLICENSE
-license usr/src/lib/libldap4/THIRDPARTYLICENSE \
-    license=usr/src/lib/libldap4/THIRDPARTYLICENSE
 license usr/src/lib/libldap5/THIRDPARTYLICENSE \
     license=usr/src/lib/libldap5/THIRDPARTYLICENSE
 license usr/src/lib/libmp/common/THIRDPARTYLICENSE \
@@ -570,8 +569,6 @@ license usr/src/lib/libshell/THIRDPARTYLICENSE \
     license=usr/src/lib/libshell/THIRDPARTYLICENSE
 license usr/src/lib/libsum/THIRDPARTYLICENSE \
     license=usr/src/lib/libsum/THIRDPARTYLICENSE
-license usr/src/lib/libwrap/THIRDPARTYLICENSE \
-    license=usr/src/lib/libwrap/THIRDPARTYLICENSE
 license usr/src/lib/pam_modules/authtok_check/THIRDPARTYLICENSE \
     license=usr/src/lib/pam_modules/authtok_check/THIRDPARTYLICENSE
 license usr/src/lib/passwdutil/THIRDPARTYLICENSE \

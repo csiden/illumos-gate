@@ -20,6 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 #include <sys/dmu.h>
@@ -85,17 +86,17 @@ top:
 
 	/* Do a preliminary error check. */
 	dstg->dstg_err = 0;
+#ifdef ZFS_DEBUG
+	/*
+	 * Only check half the time, otherwise, the sync-context
+	 * check will almost never fail.
+	 */
+	if (spa_get_random(2) == 0)
+		goto skip;
+#endif
 	rw_enter(&dstg->dstg_pool->dp_config_rwlock, RW_READER);
 	for (dst = list_head(&dstg->dstg_tasks); dst;
 	    dst = list_next(&dstg->dstg_tasks, dst)) {
-#ifdef ZFS_DEBUG
-		/*
-		 * Only check half the time, otherwise, the sync-context
-		 * check will almost never fail.
-		 */
-		if (spa_get_random(2) == 0)
-			continue;
-#endif
 		dst->dst_err =
 		    dst->dst_checkfunc(dst->dst_arg1, dst->dst_arg2, tx);
 		if (dst->dst_err)
@@ -107,6 +108,7 @@ top:
 		dmu_tx_commit(tx);
 		return (dstg->dstg_err);
 	}
+skip:
 
 	/*
 	 * We don't generally have many sync tasks, so pay the price of
@@ -161,7 +163,7 @@ dsl_sync_task_group_sync(dsl_sync_task_group_t *dstg, dmu_tx_t *tx)
 	dsl_pool_t *dp = dstg->dstg_pool;
 	uint64_t quota, used;
 
-	ASSERT3U(dstg->dstg_err, ==, 0);
+	ASSERT0(dstg->dstg_err);
 
 	/*
 	 * Check for sufficient space.  We just check against what's
@@ -228,12 +230,7 @@ dsl_sync_task_do_nowait(dsl_pool_t *dp,
     dsl_checkfunc_t *checkfunc, dsl_syncfunc_t *syncfunc,
     void *arg1, void *arg2, int blocks_modified, dmu_tx_t *tx)
 {
-	dsl_sync_task_group_t *dstg;
-
-	if (!spa_writeable(dp->dp_spa))
-		return;
-
-	dstg = dsl_sync_task_group_create(dp);
+	dsl_sync_task_group_t *dstg = dsl_sync_task_group_create(dp);
 	dsl_sync_task_create(dstg, checkfunc, syncfunc,
 	    arg1, arg2, blocks_modified);
 	dsl_sync_task_group_nowait(dstg, tx);

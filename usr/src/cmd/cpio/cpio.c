@@ -20,6 +20,8 @@
  */
 /*
  * Copyright (c) 1988, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright 2012 Milan Jurik. All rights reserved.
+ * Copyright (c) 2012 Gary Mills
  */
 
 /*	Copyright (c) 1983, 1984, 1985, 1986, 1987, 1988, 1989 AT&T	*/
@@ -824,8 +826,11 @@ main(int argc, char **argv)
 		if (close(Archive) != 0)
 			msg(EXTN, "close error");
 	}
-	Blocks = (u_longlong_t)(Blocks * Bufsize + SBlocks + 0x1FF) >> 9;
-	msg(EPOST, "%lld blocks", Blocks);
+	if ((Args & OCq) == 0) {
+		Blocks = (u_longlong_t)(Blocks * Bufsize + SBlocks +
+		    0x1FF) >> 9;
+		msg(EPOST, "%lld blocks", Blocks);
+	}
 	if (Error_cnt)
 		msg(EPOST, "%d error(s)", Error_cnt);
 	return (EXIT_CODE);
@@ -6378,24 +6383,24 @@ setup(int largc, char **largv)
 #if defined(O_XATTR)
 #if defined(_PC_SATTR_ENABLED)
 #ifdef WAITAROUND
-	char	*opts_p = "zabcdfiklmoprstuvABC:DE:H:I:LM:O:PR:SV6@/";
+	char	*opts_p = "zabcdfiklmopqrstuvABC:DE:H:I:LM:O:PR:SV6@/";
 #else
-	char	*opts_p = "abcdfiklmoprstuvABC:DE:H:I:LM:O:PR:SV6@/";
+	char	*opts_p = "abcdfiklmopqrstuvABC:DE:H:I:LM:O:PR:SV6@/";
 #endif	/* WAITAROUND */
 
 #else	/* _PC_SATTR_ENABLED */
 #ifdef WAITAROUND
-	char	*opts_p = "zabcdfiklmoprstuvABC:DE:H:I:LM:O:PR:SV6@";
+	char	*opts_p = "zabcdfiklmopqrstuvABC:DE:H:I:LM:O:PR:SV6@";
 #else
-	char	*opts_p = "abcdfiklmoprstuvABC:DE:H:I:LM:O:PR:SV6@";
+	char	*opts_p = "abcdfiklmopqrstuvABC:DE:H:I:LM:O:PR:SV6@";
 #endif	/* WAITAROUND */
 #endif	/* _PC_SATTR_ENABLED */
 
 #else	/* O_XATTR */
 #ifdef WAITAROUND
-	char	*opts_p = "zabcdfiklmoprstuvABC:DE:H:I:LM:O:PR:SV6";
+	char	*opts_p = "zabcdfiklmopqrstuvABC:DE:H:I:LM:O:PR:SV6";
 #else
-	char	*opts_p = "abcdfiklmoprstuvABC:DE:H:I:LM:O:PR:SV6";
+	char	*opts_p = "abcdfiklmopqrstuvABC:DE:H:I:LM:O:PR:SV6";
 #endif	/* WAITAROUND */
 #endif	/* O_XATTR */
 
@@ -6466,6 +6471,9 @@ setup(int largc, char **largv)
 		case 'p':	/* "pass" */
 			Max_namesz = APATH;
 			Args |= OCp;
+			break;
+		case 'q':	/* "quiet" */
+			Args |= OCq;
 			break;
 		case 'r':	/* rename files interactively */
 			Args |= OCr;
@@ -6866,7 +6874,7 @@ usage(void)
 	(void) fflush(stdout);
 #if defined(O_XATTR)
 	(void) fprintf(stderr, gettext("USAGE:\n"
-	    "\tcpio -i[bcdfkmrstuv@BSV6] [-C size] "
+	    "\tcpio -i[bcdfkmqrstuv@BSV6] [-C size] "
 	    "[-E file] [-H hdr] [-I file [-M msg]] "
 	    "[-R id] [patterns]\n"
 	    "\tcpio -o[acv@ABLV] [-C size] "
@@ -6874,7 +6882,7 @@ usage(void)
 	    "\tcpio -p[adlmuv@LV] [-R id] directory\n"));
 #else
 	(void) fprintf(stderr, gettext("USAGE:\n"
-	    "\tcpio -i[bcdfkmrstuvBSV6] [-C size] "
+	    "\tcpio -i[bcdfkmqrstuvBSV6] [-C size] "
 	    "[-E file] [-H hdr] [-I file [-M msg]] "
 	    "[-R id] [patterns]\n"
 	    "\tcpio -o[acvABLV] [-C size] "
@@ -9120,7 +9128,6 @@ sl_insert(dev_t device, ino_t inode, int ftype)
 			case 0:
 				/* found it */
 				return (p);
-				break;
 
 			case 1:
 				/* move right */

@@ -20,6 +20,7 @@
 #
 #
 # Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2012 by Delphix. All rights reserved.
 #
 
 PROG= ztest
@@ -29,8 +30,9 @@ SRCS= $(OBJS:%.o=../%.c)
 include ../../Makefile.cmd
 include ../../Makefile.ctf
 
-INCS += -I../../../lib/libzpool/common 
-INCS += -I../../../uts/common/fs/zfs 
+INCS += -I../../../lib/libzpool/common
+INCS += -I../../../uts/common/fs/zfs
+INCS += -I../../../common/zfs
 
 LDLIBS += -lumem -lzpool -lcmdutils -lm -lnvpair
 
@@ -38,11 +40,13 @@ C99MODE= -xc99=%all
 C99LMODE= -Xc99=%all
 CFLAGS += -g $(CCVERBOSE)
 CFLAGS64 += -g $(CCVERBOSE)
-CPPFLAGS += -D_LARGEFILE64_SOURCE=1 -D_REENTRANT $(INCS)
+CPPFLAGS += -D_LARGEFILE64_SOURCE=1 -D_REENTRANT $(INCS) -DDEBUG
 
 # lint complains about unused _umem_* functions
-LINTFLAGS += -xerroff=E_NAME_DEF_NOT_USED2 
-LINTFLAGS64 += -xerroff=E_NAME_DEF_NOT_USED2  
+LINTFLAGS += -xerroff=E_NAME_DEF_NOT_USED2
+LINTFLAGS64 += -xerroff=E_NAME_DEF_NOT_USED2
+
+CERRWARN += -_gcc=-Wno-switch
 
 .KEEP_STATE:
 
