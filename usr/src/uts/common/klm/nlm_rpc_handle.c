@@ -18,9 +18,10 @@
  *
  * CDDL HEADER END
  */
+
 /*
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
- * Use is subject to license terms.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 #include <sys/param.h>
@@ -44,6 +45,18 @@
 
 #include "nlm_impl.h"
 
+/*
+ * The following errors codes from nlm_null_rpc indicate that the port we have
+ * cached for the client's NLM service is stale and that we need to establish
+ * a new RPC client.
+ */
+#define	NLM_STALE_CLNT(_status)			\
+	((_status) == RPC_PROGUNAVAIL ||	\
+	(_status) == RPC_PROGVERSMISMATCH ||	\
+	(_status) == RPC_PROCUNAVAIL ||		\
+	(_status) == RPC_CANTCONNECT ||		\
+	(_status) == RPC_XPRTFAILED)
+
 static struct kmem_cache *nlm_rpch_cache = NULL;
 
 static int nlm_rpch_ctor(void *, void *, int);
@@ -52,6 +65,7 @@ static void destroy_rpch(nlm_rpc_t *);
 static nlm_rpc_t *get_nlm_rpc_fromcache(struct nlm_host *, int);
 static void update_host_rpcbinding(struct nlm_host *, int);
 static int refresh_nlm_rpc(struct nlm_host *, nlm_rpc_t *);
+static void nlm_host_rele_rpc_locked(struct nlm_host *, nlm_rpc_t *);
 
 static nlm_rpc_t *
 get_nlm_rpc_fromcache(struct nlm_host *hostp, int vers)
@@ -119,9 +133,26 @@ refresh_nlm_rpc(struct nlm_host *hostp, nlm_rpc_t *rpcp)
 	int ret;
 
 	if (rpcp->nr_handle == NULL) {
+		bool_t clset = TRUE;
+
 		ret = clnt_tli_kcreate(&hostp->nh_knc, &hostp->nh_addr,
 		    NLM_PROG, rpcp->nr_vers, 0, NLM_RPC_RETRIES,
 		    CRED(), &rpcp->nr_handle);
+
+		/*
+		 * Set the client's CLSET_NODELAYONERR option to true. The
+		 * RPC clnt_call interface creates an artificial delay for
+		 * certain call errors in order to prevent RPC consumers
+		 * from getting into tight retry loops. Since this function is
+		 * called by the NLM service routines we would like to avoid
+		 * this artificial delay when possible. We do not retry if the
+		 * NULL request fails so it is safe for us to turn this option
+		 * on.
+		 */
+		if (clnt_control(rpcp->nr_handle, CLSET_NODELAYONERR,
+		    (char *)&clset)) {
+			NLM_ERR("Unable to set CLSET_NODELAYONERR\n");
+		}
 	} else {
 		ret = clnt_tli_kinit(rpcp->nr_handle, &hostp->nh_knc,
 		    &hostp->nh_addr, 0, NLM_RPC_RETRIES, CRED());
@@ -133,10 +164,17 @@ refresh_nlm_rpc(struct nlm_host *hostp, nlm_rpc_t *rpcp)
 			 * fresh, i.e. if remote program is still sits
 			 * on the same port we assume. Call NULL proc
 			 * to do it.
+			 *
+			 * Note: Even though we set no delay on error on the
+			 * client handle the call to nlm_null_rpc can still
+			 * delay for 10 seconds before returning an error. For
+			 * example the no delay on error option is not honored
+			 * for RPC_XPRTFAILED errors (see clnt_cots_kcallit).
 			 */
 			stat = nlm_null_rpc(rpcp->nr_handle, rpcp->nr_vers);
-			if (stat == RPC_PROCUNAVAIL)
+			if (NLM_STALE_CLNT(stat)) {
 				ret = ESTALE;
+			}
 		}
 	}
 
@@ -220,7 +258,7 @@ again:
 			 */
 			mutex_enter(&hostp->nh_lock);
 			hostp->nh_rpcb_state = NRPCB_NEED_UPDATE;
-			nlm_host_rele_rpc(hostp, rpcp);
+			nlm_host_rele_rpc_locked(hostp, rpcp);
 			goto again;
 		}
 
@@ -239,8 +277,15 @@ void
 nlm_host_rele_rpc(struct nlm_host *hostp, nlm_rpc_t *rpcp)
 {
 	mutex_enter(&hostp->nh_lock);
-	TAILQ_INSERT_HEAD(&hostp->nh_rpchc, rpcp, nr_link);
+	nlm_host_rele_rpc_locked(hostp, rpcp);
 	mutex_exit(&hostp->nh_lock);
+}
+
+static void
+nlm_host_rele_rpc_locked(struct nlm_host *hostp, nlm_rpc_t *rpcp)
+{
+	ASSERT(mutex_owned(&hostp->nh_lock));
+	TAILQ_INSERT_HEAD(&hostp->nh_rpchc, rpcp, nr_link);
 }
 
 /*

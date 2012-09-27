@@ -1,5 +1,4 @@
 /*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2008 Isilon Inc http://www.isilon.com/
  * Authors: Doug Rabson <dfr@rabson.org>
  * Developed with Red Inc: Alfred Perlstein <alfred@freebsd.org>
@@ -24,6 +23,10 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+ */
+
+/*
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  */
 
 /*
@@ -55,11 +58,9 @@
 
 #include "nlm_impl.h"
 
-
 static void
 nlm_convert_to_nlm_lock(struct nlm_lock *dst, struct nlm4_lock *src)
 {
-
 	dst->caller_name = src->caller_name;
 	dst->fh = src->fh;
 	dst->oh = src->oh;
@@ -71,7 +72,6 @@ nlm_convert_to_nlm_lock(struct nlm_lock *dst, struct nlm4_lock *src)
 static void
 nlm_convert_to_nlm4_holder(struct nlm4_holder *dst, struct nlm_holder *src)
 {
-
 	dst->exclusive = src->exclusive;
 	dst->svid = src->svid;
 	dst->oh = src->oh;

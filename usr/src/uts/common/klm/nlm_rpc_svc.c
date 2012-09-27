@@ -1,5 +1,4 @@
 /*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2008 Isilon Inc http://www.isilon.com/
  * Authors: Doug Rabson <dfr@rabson.org>
  * Developed with Red Inc: Alfred Perlstein <alfred@freebsd.org>
@@ -27,6 +26,11 @@
  */
 
 /*
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
+ */
+
+/*
  * NFS Lock Manager, RPC service functions (nlm_..._svc)
  * Called via nlm_dispatch.c tables.
  *
@@ -47,6 +51,13 @@
  * Convert between various versions of the protocol structures.
  */
 
+static bool_t
+nlm_valid_nlm_lock(struct nlm_lock *lck)
+{
+	return ((lck->l_len != 0 && lck->l_offset + lck->l_len
+	    <= lck->l_offset) ? FALSE : TRUE);
+}
+
 /* Down-convert, for granted_1 call */
 static void
 nlm_convert_to_nlm_lock(struct nlm_lock *dst, struct nlm4_lock *src)
@@ -63,7 +74,6 @@ nlm_convert_to_nlm_lock(struct nlm_lock *dst, struct nlm4_lock *src)
 static void
 nlm_convert_to_nlm4_lock(struct nlm4_lock *dst, struct nlm_lock *src)
 {
-
 	dst->caller_name = src->caller_name;
 	dst->fh = src->fh;
 	dst->oh = src->oh;
@@ -75,7 +85,6 @@ nlm_convert_to_nlm4_lock(struct nlm4_lock *dst, struct nlm_lock *src)
 static void
 nlm_convert_to_nlm4_share(struct nlm4_share *dst, struct nlm_share *src)
 {
-
 	dst->caller_name = src->caller_name;
 	dst->fh = src->fh;
 	dst->oh = src->oh;
@@ -86,7 +95,6 @@ nlm_convert_to_nlm4_share(struct nlm4_share *dst, struct nlm_share *src)
 static void
 nlm_convert_to_nlm_holder(struct nlm_holder *dst, struct nlm4_holder *src)
 {
-
 	dst->exclusive = src->exclusive;
 	dst->svid = src->svid;
 	dst->oh = src->oh;
@@ -122,6 +130,12 @@ nlm_test_1_svc(struct nlm_testargs *argp, nlm_testres *resp,
 	nlm4_testargs args4;
 	nlm4_testres res4;
 
+	if (!nlm_valid_nlm_lock(&argp->alock)) {
+		resp->cookie = argp->cookie;
+		resp->stat.stat = nlm_denied;
+		return (TRUE);
+	}
+
 	bzero(&args4, sizeof (args4));
 	bzero(&res4, sizeof (res4));
 
@@ -154,6 +168,12 @@ nlm_lock_1_svc(nlm_lockargs *argp, nlm_res *resp,
 	nlm4_lockargs args4;
 	nlm4_res res4;
 
+	if (!nlm_valid_nlm_lock(&argp->alock)) {
+		resp->cookie = argp->cookie;
+		resp->stat.stat = nlm_denied;
+		return (TRUE);
+	}
+
 	bzero(&res4, sizeof (res4));
 
 	args4.cookie = argp->cookie;
@@ -184,6 +204,7 @@ nlm_lock_1_reply(SVCXPRT *transp, nlm4_res *resp)
 	return (svc_sendreply(transp, xdr_nlm_res, (char *)&res1));
 }
 
+/*ARGSUSED*/
 static enum clnt_stat
 nlm_granted_1_cb(nlm4_testargs *argp, void *null, CLIENT *clnt)
 {
@@ -201,7 +222,6 @@ nlm_granted_1_cb(nlm4_testargs *argp, void *null, CLIENT *clnt)
 
 	/* NB: We have a result our caller will not free. */
 	xdr_free((xdrproc_t)xdr_nlm_res, (void *)&res1);
-	(void) null;
 
 	return (rv);
 }
@@ -212,6 +232,12 @@ nlm_cancel_1_svc(struct nlm_cancargs *argp, nlm_res *resp,
 {
 	nlm4_cancargs args4;
 	nlm4_res res4;
+
+	if (!nlm_valid_nlm_lock(&argp->alock)) {
+		resp->cookie = argp->cookie;
+		resp->stat.stat = nlm_denied;
+		return (TRUE);
+	}
 
 	bzero(&res4, sizeof (res4));
 
@@ -234,6 +260,12 @@ nlm_unlock_1_svc(struct nlm_unlockargs *argp, nlm_res *resp,
 	nlm4_unlockargs args4;
 	nlm4_res res4;
 
+	if (!nlm_valid_nlm_lock(&argp->alock)) {
+		resp->cookie = argp->cookie;
+		resp->stat.stat = nlm_denied;
+		return (TRUE);
+	}
+
 	bzero(&res4, sizeof (res4));
 
 	args4.cookie = argp->cookie;
@@ -252,6 +284,12 @@ nlm_granted_1_svc(struct nlm_testargs *argp, nlm_res *resp,
 {
 	nlm4_testargs args4;
 	nlm4_res res4;
+
+	if (!nlm_valid_nlm_lock(&argp->alock)) {
+		resp->cookie = argp->cookie;
+		resp->stat.stat = nlm_denied;
+		return (TRUE);
+	}
 
 	bzero(&res4, sizeof (res4));
 
@@ -288,6 +326,9 @@ nlm_test_msg_1_svc(struct nlm_testargs *argp, void *resp,
 {
 	nlm4_testargs args4;
 	nlm4_testres res4;
+
+	if (!nlm_valid_nlm_lock(&argp->alock))
+		return (FALSE);
 
 	bzero(&res4, sizeof (res4));
 
@@ -333,6 +374,9 @@ nlm_lock_msg_1_svc(nlm_lockargs *argp, void *resp,
 {
 	nlm4_lockargs args4;
 	nlm4_res res4;
+
+	if (!nlm_valid_nlm_lock(&argp->alock))
+		return (FALSE);
 
 	bzero(&res4, sizeof (res4));
 
@@ -388,6 +432,9 @@ nlm_cancel_msg_1_svc(struct nlm_cancargs *argp, void *resp,
 	nlm4_cancargs args4;
 	nlm4_res res4;
 
+	if (!nlm_valid_nlm_lock(&argp->alock))
+		return (FALSE);
+
 	bzero(&res4, sizeof (res4));
 
 	args4.cookie = argp->cookie;
@@ -425,6 +472,9 @@ nlm_unlock_msg_1_svc(struct nlm_unlockargs *argp, void *resp,
 	nlm4_unlockargs args4;
 	nlm4_res res4;
 
+	if (!nlm_valid_nlm_lock(&argp->alock))
+		return (FALSE);
+
 	bzero(&res4, sizeof (res4));
 
 	args4.cookie = argp->cookie;
@@ -459,6 +509,9 @@ nlm_granted_msg_1_svc(struct nlm_testargs *argp, void *resp,
 {
 	nlm4_testargs args4;
 	nlm4_res res4;
+
+	if (!nlm_valid_nlm_lock(&argp->alock))
+		return (FALSE);
 
 	bzero(&res4, sizeof (res4));
 
@@ -606,6 +659,9 @@ nlm_nm_lock_3_svc(nlm_lockargs *argp, nlm_res *resp, struct svc_req *sr)
 	nlm4_lockargs args4;
 	nlm4_res res4;
 
+	if (!nlm_valid_nlm_lock(&argp->alock))
+		return (FALSE);
+
 	bzero(&res4, sizeof (res4));
 
 	args4.cookie = argp->cookie;
@@ -669,7 +725,6 @@ bool_t
 nlm4_lock_4_svc(nlm4_lockargs *argp, nlm4_res *resp,
     struct svc_req *sr)
 {
-
 	/* NLM4_LOCK */
 	nlm_do_lock(argp, resp, sr,
 	    nlm4_lock_4_reply, NULL,

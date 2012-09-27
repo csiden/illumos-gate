@@ -34,8 +34,6 @@
 #ifndef _SYS_FLOCK_H
 #define	_SYS_FLOCK_H
 
-#pragma ident	"%Z%%M%	%I%	%E% SMI"
-
 #include <sys/types.h>
 #include <sys/fcntl.h>
 #include <sys/vnode.h>

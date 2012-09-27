@@ -21,10 +21,6 @@
 /* ONC_PLUS EXTRACT START */
 
 /*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
- */
-
-/*
  * Copyright 2007 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
@@ -32,7 +28,9 @@
 /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T */
 /*	All Rights Reserved */
 
-#pragma ident	"%Z%%M%	%I%	%E% SMI"
+/*
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ */
 
 #include <sys/flock_impl.h>
 #include <sys/vfs.h>

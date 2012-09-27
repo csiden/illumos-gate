@@ -20,10 +20,10 @@
  * CDDL HEADER END
  */
 /*
- * Network lock manager protocol definition
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (C) 1986, 1992, 1993, 1997, 1999 by Sun Microsystems, Inc.
  * All rights reserved.
+ *
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  *
  * Protocol used between local lock manager and remote lock manager.
  *

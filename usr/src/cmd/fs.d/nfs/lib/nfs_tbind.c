@@ -18,11 +18,11 @@
  *
  * CDDL HEADER END
  */
+
 /*
  * Copyright (c) 1996, 2010, Oracle and/or its affiliates. All rights reserved.
- */
-/*
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 
@@ -1725,8 +1725,7 @@ set_addrmask(int fd,
 			return (0);
 		}
 
-		syslog(LOG_ERR, "set_addrmask: address size: %ld",
-			info.addr);
+		syslog(LOG_ERR, "set_addrmask: address size: %ld", info.addr);
 		return (-1);
 	}
 

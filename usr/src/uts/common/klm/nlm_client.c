@@ -1,5 +1,4 @@
 /*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2008 Isilon Inc http://www.isilon.com/
  * Authors: Doug Rabson <dfr@rabson.org>
  * Developed with Red Inc: Alfred Perlstein <alfred@freebsd.org>
@@ -24,6 +23,11 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+ */
+
+/*
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 /*
@@ -158,7 +162,7 @@ nlm_reclaim_client(struct nlm_globals *g, struct nlm_host *hostp)
 		 * done by the host, because we don't allow
 		 * reclamation of sleeping locks. The reason
 		 * we do this is that allowing of sleeping locks
-		 * reclation can potentially break locks recovery
+		 * reclamation can potentially break locks recovery
 		 * order.
 		 *
 		 * Imagine that we have two client machines A and B
@@ -492,7 +496,7 @@ nlm_client_cancel_all(struct nlm_globals *g, struct nlm_host *hostp)
 
 /*
  * The function determines whether the lock "fl" can
- * be safely upplied to the file vnode "vp" corresponds to.
+ * be safely applied to the file vnode "vp" corresponds to.
  * The lock can be "safely" applied if all the conditions
  * above are held:
  *  - It's not a mandatory lock
@@ -557,9 +561,9 @@ nlm_safemap(const vnode_t *vp)
 	g = zone_getspecific(nlm_zone_key, curzone);
 	mutex_enter(&g->lock);
 	TAILQ_FOREACH(nslp, &g->nlm_slocks, nsl_link) {
-		if (nslp->nsl_state == NLM_SL_BLOCKED	&&
-		    nslp->nsl_vp == vp			&&
-		    (nslp->nsl_lock.l_offset != 0	||
+		if (nslp->nsl_state == NLM_SL_BLOCKED &&
+		    nslp->nsl_vp == vp &&
+		    (nslp->nsl_lock.l_offset != 0 ||
 		    nslp->nsl_lock.l_len != 0)) {
 			safe = 0;
 			break;
@@ -580,8 +584,8 @@ nlm_has_sleep(const vnode_t *vp)
 	g = zone_getspecific(nlm_zone_key, curzone);
 	mutex_enter(&g->lock);
 	TAILQ_FOREACH(nslp, &g->nlm_slocks, nsl_link) {
-		if (nslp->nsl_state	== NLM_SL_BLOCKED &&
-		    nslp->nsl_vp	== vp) {
+		if (nslp->nsl_state == NLM_SL_BLOCKED &&
+		    nslp->nsl_vp == vp) {
 			has_slocks = TRUE;
 			break;
 		}
@@ -638,15 +642,6 @@ nlm_reclaim_lock(struct nlm_host *hostp, vnode_t *vp,
 	return (nlm_call_lock(vp, flp, hostp, &lm_fh,
 	    NULL, vers, NLM_X_RECLAIM));
 }
-
-/*
- * Moved these to nlm_client.c:
- * nlm_test_rpc
- * nlm_lock_rpc
- * nlm_cancel_rpc
- * nlm_unlock_rpc
- */
-
 
 /*
  * Get local lock information for some NFS server.
@@ -1521,6 +1516,7 @@ nlm_init_fh_by_vp(vnode_t *vp, struct netobj *fh, rpcvers_t *lm_vers)
 		/* See nfs_frlock() */
 		*lm_vers = NLM_VERS;
 		fh->n_len = sizeof (fhandle_t);
+		/* LINTED E_BAD_PTR_CAST_ALIGN */
 		fh->n_bytes = (char *)VTOFH(vp);
 		break;
 	default:

@@ -19,9 +19,6 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
- */
-/*
  * Copyright 2007 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
@@ -240,16 +237,6 @@ statd_init()
 		"statd: unable to create thread for thr_statd_init\n");
 		exit(1);
 	}
-
-	/*
-	 * in_crash is set to 1 either in sm_simu_crash_svc()
-	 * or in main() which calls statd_init(). After we
-	 * reinitialized all resources, we must set it back
-	 * to 0.
-	 */
-	mutex_lock(&crash_lock);
-	in_crash = 0;
-	mutex_unlock(&crash_lock);
 }
 
 /*

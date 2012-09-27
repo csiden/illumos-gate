@@ -11,6 +11,7 @@
 
 /*
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 /*
@@ -343,7 +344,7 @@ lm_shutdown(void)
  * Cleanup remote locks on FS un-export.
  *
  * NOTE: called from nfs_export.c:unexport()
- * when right before the share is going to
+ * right before the share is going to
  * be unexported.
  */
 void
@@ -412,19 +413,6 @@ lm_vp_active(const vnode_t *vp)
 }
 
 /*
- * NOTE: there's something worth to say about lm_sysid
- * structure and functions around it (like lm_get_sysid()
- * and lm_rel_sysid()). Closed source lock manager provided
- * this structure to the modules outside and had an interface
- * to obtain and release it. We use struct lm_sysid as an
- * anonymous equivalent to structure nlm_host.
- *
- * NOTE: may be in future it'd be better to get rid of
- * lm_sysid and use nlm_host instead (well, qutely
- * typedefed nlm_host).
- */
-
-/*
  * Find or create a "sysid" for given knc+addr.
  * name is optional.  Sets nc_changed if the
  * found knc_proto is different from passed.
@@ -444,6 +432,12 @@ lm_get_sysid(struct knetconfig *knc, struct netbuf *addr,
 	netid = nlm_knc_to_netid(knc);
 	if (netid == NULL)
 		return (NULL);
+
+	/*
+	 * The netconfig needs to be active in order to create a new nlm_host
+	 * entry (nlm_knc_activate is idempotent).
+	 */
+	nlm_knc_activate(knc);
 
 	g = zone_getspecific(nlm_zone_key, curzone);
 

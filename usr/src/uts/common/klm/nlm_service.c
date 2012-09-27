@@ -1,5 +1,4 @@
 /*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2008 Isilon Inc http://www.isilon.com/
  * Authors: Doug Rabson <dfr@rabson.org>
  * Developed with Red Inc: Alfred Perlstein <alfred@freebsd.org>
@@ -24,6 +23,11 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+ */
+
+/*
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 /*
@@ -143,6 +147,7 @@ nlm_fh_to_vp(struct netobj *fh)
 		return (NULL);
 
 	/* We know this is aligned (kmem_alloc) */
+	/* LINTED E_BAD_PTR_CAST_ALIGN */
 	fhp = (fhandle_t *)fh->n_bytes;
 	return (lm_fhtovp(fhp));
 }
@@ -248,7 +253,6 @@ nlm_do_test(nlm4_testargs *argp, nlm4_testres *resp,
 {
 	struct nlm_globals *g;
 	struct nlm_host *host;
-	struct nlm_owner_handle oh;
 	nlm_rpc_t *rpcp = NULL;
 	vnode_t *vp = NULL;
 	struct netbuf *addr;
@@ -304,18 +308,20 @@ nlm_do_test(nlm4_testargs *argp, nlm4_testres *resp,
 		resp->stat.stat = nlm4_granted;
 	} else {
 		struct nlm4_holder *lh;
+		struct nlm_owner_handle *oh;
+
+		/* Freed when nlm_dispatch XDR frees the result structure. */
+		oh = kmem_zalloc(sizeof (*oh), KM_SLEEP);
+		oh->oh_sysid = (sysid_t)fl.l_sysid;
 
 		resp->stat.stat = nlm4_denied;
 		lh = &resp->stat.nlm4_testrply_u.holder;
 		lh->exclusive = (fl.l_type == F_WRLCK);
 		lh->svid = fl.l_pid;
-		lh->oh.n_len = sizeof (oh);
-		lh->oh.n_bytes = (void *)&oh;
+		lh->oh.n_len = sizeof (*oh);
+		lh->oh.n_bytes = (char *)oh;
 		lh->l_offset = fl.l_start;
 		lh->l_len = fl.l_len;
-
-		bzero(&oh, sizeof (oh));
-		oh.oh_sysid = (sysid_t)fl.l_sysid;
 	}
 
 out:
@@ -424,7 +430,16 @@ nlm_do_lock(nlm4_lockargs *argp, nlm4_res *resp, struct svc_req *sr,
 	 */
 	nvp = nlm_fh_to_vhold(host, &argp->alock.fh);
 	if (nvp == NULL) {
-		resp->stat.stat = nlm4_stale_fh;
+		status = nlm4_stale_fh;
+		goto doreply;
+	}
+
+	/*
+	 * Check for overflow.
+	 */
+	if (argp->alock.l_len != 0 && argp->alock.l_offset + argp->alock.l_len
+	    <= argp->alock.l_offset) {
+		status = nlm4_failed;
 		goto doreply;
 	}
 

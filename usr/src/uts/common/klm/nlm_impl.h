@@ -1,5 +1,4 @@
 /*
- * Copyright 2012 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2008 Isilon Inc http://www.isilon.com/
  * Authors: Doug Rabson <dfr@rabson.org>
  * Developed with Red Inc: Alfred Perlstein <alfred@freebsd.org>
@@ -26,6 +25,10 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD$
+ */
+
+/*
+ * Copyright 2012 Nexenta Systems, Inc.  All rights reserved.
  */
 
 /*

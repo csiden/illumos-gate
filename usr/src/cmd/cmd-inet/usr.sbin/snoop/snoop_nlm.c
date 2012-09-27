@@ -23,8 +23,10 @@
  * Copyright (c) 1991, 1998, 2001 by Sun Microsystems, Inc.
  * All rights reserved.
  */
+
 /*
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 #include <sys/types.h>

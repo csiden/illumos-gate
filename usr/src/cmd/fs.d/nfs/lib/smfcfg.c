@@ -18,11 +18,10 @@
  *
  * CDDL HEADER END
  */
-/*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
- */
+
 /*
  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -375,7 +374,7 @@ nfs_smf_get_iprop(char *prop_name, int *rvp, char *instance,
 	if (rc != SA_OK)
 		return (rc);
 	errno = 0;
-	val = strtol(propbuf, (char **)NULL, 10);
+	val = strtol(propbuf, NULL, 10);
 	if (errno != 0)
 		return (SA_BAD_VALUE);
 	*rvp = val;
