@@ -114,6 +114,8 @@ static vnode_t *nlm_fh_to_vp(struct netobj *);
 static struct nlm_vhold *nlm_fh_to_vhold(struct nlm_host *, struct netobj *);
 static void nlm_init_shrlock(struct shrlock *, nlm4_share *, struct nlm_host *);
 static callb_cpr_t *nlm_block_callback(flk_cb_when_t, void *);
+static int nlm_vop_frlock(vnode_t *, int, flock64_t *, int, offset_t,
+    struct flk_callback *, cred_t *, caller_context_t *);
 
 /*
  * Convert a lock from network to local form, and
@@ -338,7 +340,7 @@ nlm_do_test(nlm4_testargs *argp, nlm4_testres *resp,
 	}
 
 	/* BSD: VOP_ADVLOCK(nv->nv_vp, NULL, F_GETLK, &fl, F_REMOTE); */
-	error = VOP_FRLOCK(vp, F_GETLK, &fl,
+	error = nlm_vop_frlock(vp, F_GETLK, &fl,
 	    F_REMOTELOCK | FREAD | FWRITE,
 	    (u_offset_t)0, NULL, CRED(), NULL);
 	if (error) {
@@ -469,7 +471,7 @@ nlm_do_lock(nlm4_lockargs *argp, nlm4_res *resp, struct svc_req *sr,
 	 * One client using multiple transports gets separate
 	 * host objects (and sysids) for each of its transports.
 	 */
-	if (res_cb != NULL || (grant_cb != NULL && argp->block)) {
+	if (res_cb != NULL || (grant_cb != NULL && argp->block == TRUE)) {
 		error = nlm_host_get_rpc(host, sr->rq_vers, &rpcp);
 		if (error != 0) {
 			status = nlm4_denied_nolocks;
@@ -519,7 +521,7 @@ nlm_do_lock(nlm4_lockargs *argp, nlm4_res *resp, struct svc_req *sr,
 	 * possible errors like EROFS, etc.
 	 */
 	flags = F_REMOTELOCK | FREAD | FWRITE;
-	error = VOP_FRLOCK(nvp->nv_vp, F_SETLK, &fl, flags,
+	error = nlm_vop_frlock(nvp->nv_vp, F_SETLK, &fl, flags,
 	    (u_offset_t)0, NULL, CRED(), NULL);
 
 	DTRACE_PROBE3(setlk__res, struct flock64 *, &fl,
@@ -684,7 +686,7 @@ nlm_block(nlm4_lockargs *lockargs,
 	flk_init_callback(&flk_cb, nlm_block_callback, &cb_data);
 
 	/* BSD: VOP_ADVLOCK(vp, NULL, F_SETLK, fl, F_REMOTE); */
-	error = VOP_FRLOCK(nvp->nv_vp, F_SETLKW, flp,
+	error = nlm_vop_frlock(nvp->nv_vp, F_SETLKW, flp,
 	    F_REMOTELOCK | FREAD | FWRITE,
 	    (u_offset_t)0, &flk_cb, CRED(), NULL);
 
@@ -801,7 +803,7 @@ nlm_do_cancel(nlm4_cancargs *argp, nlm4_res *resp,
 	}
 
 	fl.l_type = F_UNLCK;
-	error = VOP_FRLOCK(nvp->nv_vp, F_SETLK, &fl,
+	error = nlm_vop_frlock(nvp->nv_vp, F_SETLK, &fl,
 	    F_REMOTELOCK | FREAD | FWRITE,
 	    (u_offset_t)0, NULL, CRED(), NULL);
 
@@ -888,7 +890,7 @@ nlm_do_unlock(nlm4_unlockargs *argp, nlm4_res *resp,
 		goto out;
 
 	/* BSD: VOP_ADVLOCK(nv->nv_vp, NULL, F_UNLCK, &fl, F_REMOTE); */
-	error = VOP_FRLOCK(vp, F_SETLK, &fl,
+	error = nlm_vop_frlock(vp, F_SETLK, &fl,
 	    F_REMOTELOCK | FREAD | FWRITE,
 	    (u_offset_t)0, NULL, CRED(), NULL);
 
@@ -1181,4 +1183,20 @@ out:
 		VN_RELE(vp);
 
 	nlm_host_release(g, host);
+}
+
+/*
+ * NLM wrapper to VOP_FRLOCK that checks the validity of the lock before
+ * invoking the vnode operation.
+ */
+static int
+nlm_vop_frlock(vnode_t *vp, int cmd, flock64_t *bfp, int flag, offset_t offset,
+	struct flk_callback *flk_cbp, cred_t *cr, caller_context_t *ct)
+{
+	if (bfp->l_len != 0 && bfp->l_start + (bfp->l_len - 1)
+            < bfp->l_start) {
+		return (EOVERFLOW);
+	}
+
+	return (VOP_FRLOCK(vp, cmd, bfp, flag, offset, flk_cbp, cr, ct));
 }
