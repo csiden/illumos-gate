@@ -10,7 +10,7 @@
 #
 
 #
-# Copyright 2010 Nexenta Systems, Inc.  All rights reserved.
+# Copyright 2013 Nexenta Systems, Inc.  All rights reserved.
 #
 
 # cmd/fs.d/nfs/lockd/Makefile
@@ -26,9 +26,14 @@ LIBOBJS=	nfs_tbind.o thrpool.o daemon.o smfcfg.o
 OBJS=		$(LOCAL) $(LIBOBJS)
 
 SRCS=		$(LOCAL:%.o=%.c) $(LIBOBJS:%.o=../lib/%.c)
+LDLIBS +=	-lnsl -lscf
 CPPFLAGS +=	-I../lib
 C99MODE= $(C99_ENABLE)
-LDLIBS +=	-lnsl -lscf
+
+CERRWARN +=	-_gcc=-Wno-parentheses
+CERRWARN +=	-_gcc=-Wno-switch
+CERRWARN +=	-_gcc=-Wno-unused-variable
+CERRWARN +=	-_gcc=-Wno-uninitialized
 
 #
 # Message catalog
@@ -54,7 +59,7 @@ $(POFILE): $(SRCS)
 	sed "/^domain/d" messages.po > $@
 	$(RM) $(POFILE).i messages.po
 
-lint:		$(SRCS) lint_SRCS
+lint:	$(SRCS) lint_SRCS
 
 clean:
-		$(RM) $(OBJS)
+	$(RM) $(OBJS)

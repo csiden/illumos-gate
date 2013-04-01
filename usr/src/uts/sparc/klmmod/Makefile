@@ -48,7 +48,9 @@ INSTALL_TARGET	= $(BINARY) $(ROOTMODULE)
 #
 #	Overrides.
 #
+MAPFILE		= $(UTSBASE)/common/klm/mapfile-mod
 LDFLAGS		+= -dy -Nfs/nfs -Nstrmod/rpcmod
+LDFLAGS		+= -M $(MAPFILE)
 
 #
 # For now, disable these lint checks; maintainers should endeavor
@@ -56,6 +58,8 @@ LDFLAGS		+= -dy -Nfs/nfs -Nstrmod/rpcmod
 # Please do not carry these forward to new Makefiles.
 #
 LINTTAGS	+= -erroff=E_BAD_PTR_CAST_ALIGN
+
+CERRWARN	+= -_gcc=-Wno-switch
 
 #
 #	Default build targets.
