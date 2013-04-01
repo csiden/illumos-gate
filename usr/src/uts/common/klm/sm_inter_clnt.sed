@@ -20,4 +20,3 @@ i\
 #include <rpcsvc/sm_inter.h>
 }
 /^.include/,/^.endif/d
-

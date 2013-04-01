@@ -19,10 +19,9 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
- */
-/*
  * Copyright (c) 1989, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright 2013 Nexenta Systems, Inc.  All rights reserved.
  */
 
 /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T		*/
@@ -505,7 +504,7 @@ sigterm_handler(void)
 static void
 shutdown_lockd(void)
 {
-	(void )_nfssys(KILL_LOCKMGR, NULL);
+	(void) _nfssys(KILL_LOCKMGR, NULL);
 }
 
 
@@ -524,18 +523,10 @@ nlmsvc(int fd, struct netbuf addrmask, struct netconfig *nconf)
 	 * knetconfig from n_fmly, n_proto.  We use these
 	 * two fields to convey the family and semantics.
 	 */
-
-
 	lma.fd = fd;
 	lma.n_fmly = ncfmly_to_lmfmly(nconf->nc_protofmly);
 	lma.n_proto = nctype_to_lmprot(nconf->nc_semantics);
 	lma.n_rdev = ncdev_to_rdev(nconf->nc_device);
-
-	/*
-	 * FIXME[DK]: make debug=3 by default to simplify development.
-	 * Later the following line must be removed.
-	 */
-	lma.debug = 3;
 
 	return (_nfssys(LM_SVC, &lma));
 }

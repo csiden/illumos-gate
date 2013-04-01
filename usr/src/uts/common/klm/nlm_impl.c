@@ -1,5 +1,4 @@
 /*
- * Copyright 2012 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2008 Isilon Inc http://www.isilon.com/
  * Authors: Doug Rabson <dfr@rabson.org>
  * Developed with Red Inc: Alfred Perlstein <alfred@freebsd.org>
@@ -24,6 +23,11 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+ */
+
+/*
+ * Copyright 2012 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 /*
@@ -101,12 +105,12 @@ struct nlm_knc {
 #define	NLM_BMAP_WORDS  (NLM_BMAP_NITEMS / BT_NBIPUL)
 
 /*
- * Given an interger x, the macro is returned
+ * Given an integer x, the macro returns
  * -1 if x is negative,
  *  0 if x is zero
  *  1 if x is positive
  */
-#define	SIGN(x) (((x) < 0) - ((x) > 0))
+#define	SIGN(x) (((x) > 0) - ((x) < 0))
 
 #define	ARRSIZE(arr)	(sizeof (arr) / sizeof ((arr)[0]))
 #define	NLM_KNCS	ARRSIZE(nlm_netconfigs)
@@ -1212,7 +1216,7 @@ nlm_host_notify_server(struct nlm_host *hostp, int32_t state)
  * Deal with a server restart.  If we are stopping the
  * NLM service, we'll have newstate == 0, and will just
  * cancel all our client-side lock requests.  Otherwise,
- * star the "recovery" process to reclaim any locks
+ * start the "recovery" process to reclaim any locks
  * we hold on this server.
  */
 void
@@ -1336,7 +1340,7 @@ nlm_host_cancel_slocks(struct nlm_globals *g, struct nlm_host *hostp)
  * Garbage collect stale vhold objects.
  *
  * In other words check whether vnodes that are
- * held by vnold objects still have any locks
+ * held by vhold objects still have any locks
  * or shares or still in use. If they aren't,
  * just destroy them.
  */
@@ -1400,7 +1404,7 @@ nlm_host_has_cli_locks(struct nlm_host *hostp)
 	 * XXX: It's not the way I'd like to do the check,
 	 * because flk_sysid_has_locks() can be very
 	 * expensive by design. Unfortunatelly it iterates
-	 * throght all locks on the system, doesn't matter
+	 * through all locks on the system, doesn't matter
 	 * were they made on remote system via NLM or
 	 * on local system via reclock. To understand the
 	 * problem, consider that there're dozens of thousands
@@ -1421,7 +1425,7 @@ nlm_host_has_cli_locks(struct nlm_host *hostp)
 
 	/*
 	 * Check whether host has any share reservations
-	 * registered on the client sied.
+	 * registered on the client side.
 	 */
 	if (hostp->nh_shrlist != NULL)
 		return (TRUE);
@@ -1462,7 +1466,9 @@ nlm_netbuf_addrs_cmp(struct netbuf *nb1, struct netbuf *nb2)
 	} *na1, *na2;
 	int res;
 
+	/* LINTED E_BAD_PTR_CAST_ALIGN */
 	na1 = (union nlm_addr *)nb1->buf;
+	/* LINTED E_BAD_PTR_CAST_ALIGN */
 	na2 = (union nlm_addr *)nb2->buf;
 
 	if (na1->sa.sa_family < na2->sa.sa_family)
@@ -1481,7 +1487,7 @@ nlm_netbuf_addrs_cmp(struct netbuf *nb1, struct netbuf *nb2)
 		break;
 	default:
 		VERIFY(0);
-		break;
+		return (0);
 	}
 
 	return (SIGN(res));
@@ -2310,18 +2316,18 @@ nlm_pool_shutdown(void)
  * NLM owns at the moment.
  *
  * NOTE: NFS code can call NLM while it's
- * stopping or even if it's shut down. Any attemp
+ * stopping or even if it's shut down. Any attempt
  * to lock file either on client or on the server
  * will fail if NLM isn't in NLM_ST_UP state.
  */
 void
 nlm_svc_stopping(struct nlm_globals *g)
 {
-	ASSERT(g->run_status == NLM_ST_STOPPING);
 	mutex_enter(&g->lock);
+	ASSERT(g->run_status == NLM_ST_STOPPING);
 
 	/*
-	 * Ask NLM GC thread to exit and wait until it do dies.
+	 * Ask NLM GC thread to exit and wait until it dies.
 	 */
 	cv_signal(&g->nlm_gc_sched_cv);
 	while (g->nlm_gc_thread != NULL)
@@ -2419,7 +2425,9 @@ nlm_vp_active(const vnode_t *vp)
 	mutex_enter(&g->lock);
 	hostp = avl_first(&g->nlm_hosts_tree);
 	while (hostp != NULL) {
+		mutex_enter(&hostp->nh_lock);
 		nvp = nlm_vhold_find_locked(hostp, vp);
+		mutex_exit(&hostp->nh_lock);
 		if (nvp != NULL) {
 			active = 1;
 			break;
