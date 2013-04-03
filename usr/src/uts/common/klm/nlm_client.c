@@ -89,7 +89,6 @@ static volatile uint32_t nlm_xid = 1;
 static int nlm_init_fh_by_vp(vnode_t *, struct netobj *, rpcvers_t *);
 static int nlm_map_status(nlm4_stats);
 static int nlm_map_clnt_stat(enum clnt_stat);
-static const char *nlm_servinfo_netid(servinfo_t *);
 static void nlm_send_siglost(pid_t);
 
 static int nlm_frlock_getlk(struct nlm_host *, vnode_t *,
@@ -270,7 +269,7 @@ nlm_frlock(struct vnode *vp, int cmd, struct flock64 *flkp,
 	mi = VTOMI(vp);
 	sv = mi->mi_curr_serv;
 
-	netid = nlm_servinfo_netid(sv);
+	netid = nlm_knc_to_netid(sv->sv_knconf);
 	if (netid == NULL) {
 		NLM_ERR("nlm_frlock: unknown NFS netid");
 		return (ENOSYS);
@@ -1182,7 +1181,7 @@ nlm_shrlock(struct vnode *vp, int cmd, struct shrlock *shr,
 	mi = VTOMI(vp);
 	sv = mi->mi_curr_serv;
 
-	netid = nlm_servinfo_netid(sv);
+	netid = nlm_knc_to_netid(sv->sv_knconf);
 	if (netid == NULL) {
 		NLM_ERR("nlm_shrlock: unknown NFS netid\n");
 		return (ENOSYS);
@@ -1524,18 +1523,6 @@ nlm_init_fh_by_vp(vnode_t *vp, struct netobj *fh, rpcvers_t *lm_vers)
 	}
 
 	return (0);
-}
-
-static const char *
-nlm_servinfo_netid(servinfo_t *svp)
-{
-	const char *netid;
-
-	netid = nlm_knc_to_netid(svp->sv_knconf);
-	if (netid != NULL)
-		nlm_knc_activate(svp->sv_knconf);
-
-	return (netid);
 }
 
 /*

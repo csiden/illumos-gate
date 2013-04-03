@@ -26,7 +26,7 @@
  */
 
 /*
- * Copyright 2012 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright 2013 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
@@ -2222,7 +2222,7 @@ nlm_svc_add_ep(struct file *fp, const char *netid, struct knetconfig *knc)
 	if (error != 0)
 		return (error);
 
-	nlm_knc_activate(knc);
+	(void) nlm_knc_to_netid(knc);
 	return (0);
 }
 
@@ -2573,29 +2573,38 @@ nlm_caller_is_local(SVCXPRT *transp)
 }
 
 /*
- * Get netid string correspondig to the
- * given knetconfig.
+ * Get netid string correspondig to the given knetconfig.
+ * If not done already, save knc->knc_rdev in our table.
  */
 const char *
 nlm_knc_to_netid(struct knetconfig *knc)
 {
 	int i;
+	dev_t rdev;
+	struct nlm_knc *nc;
 	const char *netid = NULL;
 
 	rw_enter(&lm_lck, RW_READER);
 	for (i = 0; i < NLM_KNCS; i++) {
-		struct knetconfig *knc_iter;
+		nc = &nlm_netconfigs[i];
 
-		knc_iter = &nlm_netconfigs[i].n_knc;
-		if (knc_iter->knc_semantics == knc->knc_semantics &&
-		    strcmp(knc_iter->knc_protofmly,
+		if (nc->n_knc.knc_semantics == knc->knc_semantics &&
+		    strcmp(nc->n_knc.knc_protofmly,
 		    knc->knc_protofmly) == 0) {
-			netid = nlm_netconfigs[i].n_netid;
+			netid = nc->n_netid;
+			rdev = nc->n_knc.knc_rdev;
 			break;
 		}
 	}
-
 	rw_exit(&lm_lck);
+
+	if (netid != NULL && rdev == NODEV) {
+		rw_enter(&lm_lck, RW_WRITER);
+		if (nc->n_knc.knc_rdev == NODEV)
+			nc->n_knc.knc_rdev = knc->knc_rdev;
+		rw_exit(&lm_lck);
+	}
+
 	return (netid);
 }
 
@@ -2623,31 +2632,6 @@ nlm_knc_from_netid(const char *netid, struct knetconfig *knc)
 	}
 
 	return (ret);
-}
-
-void
-nlm_knc_activate(struct knetconfig *knc)
-{
-	int i;
-
-	rw_enter(&lm_lck, RW_WRITER);
-	for (i = 0; i < NLM_KNCS; i++) {
-		struct knetconfig *knc_iter;
-
-		knc_iter = &nlm_netconfigs[i].n_knc;
-		if (knc_iter->knc_rdev != NODEV)
-			continue;
-
-		if (knc_iter->knc_semantics == knc->knc_semantics &&
-		    strcmp(knc_iter->knc_protofmly,
-		    knc->knc_protofmly) == 0 &&
-		    strcmp(knc_iter->knc_proto, knc->knc_proto) == 0) {
-			knc_iter->knc_rdev = knc->knc_rdev;
-			break;
-		}
-	}
-
-	rw_exit(&lm_lck);
 }
 
 void

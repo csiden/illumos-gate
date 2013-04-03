@@ -548,7 +548,6 @@ void nlm_prog_4(struct svc_req *rqstp, SVCXPRT *transp);
  */
 const char *nlm_knc_to_netid(struct knetconfig *);
 int nlm_knc_from_netid(const char *, struct knetconfig *);
-void nlm_knc_activate(struct knetconfig *);
 
 /*
  * NLM host functions (nlm_impl.c)

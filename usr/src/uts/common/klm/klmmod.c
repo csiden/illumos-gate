@@ -433,12 +433,6 @@ lm_get_sysid(struct knetconfig *knc, struct netbuf *addr,
 	if (netid == NULL)
 		return (NULL);
 
-	/*
-	 * The netconfig needs to be active in order to create a new nlm_host
-	 * entry (nlm_knc_activate is idempotent).
-	 */
-	nlm_knc_activate(knc);
-
 	g = zone_getspecific(nlm_zone_key, curzone);
 
 	hostp = nlm_host_findcreate(g, name, netid, addr);
