@@ -565,7 +565,6 @@ void nlm_host_unmonitor(struct nlm_globals *, struct nlm_host *);
 void nlm_host_notify_server(struct nlm_host *, int32_t);
 void nlm_host_notify_client(struct nlm_host *, int32_t);
 
-int nlm_host_get_sysid(struct nlm_host *);
 int nlm_host_get_state(struct nlm_host *);
 
 struct nlm_vhold *nlm_vhold_get(struct nlm_host *, vnode_t *);

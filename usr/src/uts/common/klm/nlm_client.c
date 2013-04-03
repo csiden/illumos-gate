@@ -147,7 +147,7 @@ nlm_reclaim_client(struct nlm_globals *g, struct nlm_host *hostp)
 	struct nlm_shres *nsp_head, *nsp;
 	bool_t restart;
 
-	sysid = nlm_host_get_sysid(hostp) | LM_SYSID_CLIENT;
+	sysid = hostp->nh_sysid | LM_SYSID_CLIENT;
 	do {
 		error = 0;
 		restart = FALSE;
@@ -380,7 +380,7 @@ nlm_frlock_setlk(struct nlm_host *hostp, vnode_t *vp,
 	 * Fill in l_sysid for the local locking calls.
 	 * Also, let's not trust the caller's l_pid.
 	 */
-	flkp->l_sysid = nlm_host_get_sysid(hostp) | LM_SYSID_CLIENT;
+	flkp->l_sysid = hostp->nh_sysid | LM_SYSID_CLIENT;
 	flkp->l_pid = curproc->p_pid;
 
 	if (flkp->l_type == F_UNLCK) {
@@ -454,7 +454,7 @@ nlm_client_cancel_all(struct nlm_globals *g, struct nlm_host *hostp)
 	rpcvers_t vers;
 	int error, sysid;
 
-	sysid = nlm_host_get_sysid(hostp) | LM_SYSID_CLIENT;
+	sysid = hostp->nh_sysid | LM_SYSID_CLIENT;
 	nlm_host_cancel_slocks(g, hostp);
 
 	/*
@@ -601,7 +601,7 @@ nlm_register_lock_locally(struct vnode *vp, struct nlm_host *hostp,
 	int sysid = 0;
 
 	if (hostp != NULL) {
-		sysid = nlm_host_get_sysid(hostp) | LM_SYSID_CLIENT;
+		sysid = hostp->nh_sysid | LM_SYSID_CLIENT;
 	}
 
 	flk->l_sysid = sysid;
@@ -1197,7 +1197,7 @@ nlm_shrlock(struct vnode *vp, int cmd, struct shrlock *shr,
 	 * Also, let's not trust the caller's l_pid.
 	 */
 	shlk = *shr;
-	shlk.s_sysid = nlm_host_get_sysid(host) | LM_SYSID_CLIENT;
+	shlk.s_sysid = host->nh_sysid | LM_SYSID_CLIENT;
 	shlk.s_pid = curproc->p_pid;
 
 	if (cmd == F_UNSHARE) {
