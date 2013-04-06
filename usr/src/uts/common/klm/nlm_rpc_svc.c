@@ -1,5 +1,4 @@
 /*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2008 Isilon Inc http://www.isilon.com/
  * Authors: Doug Rabson <dfr@rabson.org>
  * Developed with Red Inc: Alfred Perlstein <alfred@freebsd.org>
@@ -27,6 +26,11 @@
  */
 
 /*
+ * Copyright 2013 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
+ */
+
+/*
  * NFS Lock Manager, RPC service functions (nlm_..._svc)
  * Called via nlm_dispatch.c tables.
  *
@@ -47,7 +51,17 @@
  * Convert between various versions of the protocol structures.
  */
 
-/* Down-convert, for granted_1 call */
+/*
+ * Down-convert, for granted_1 call
+ *
+ * This converts a 64-bit lock to 32-bit form for our granted
+ * call-back when we're dealing with a 32-bit NLM client.
+ * Our NLM_LOCK handler ensures that any lock we grant to a
+ * 32-bit client can be represented in 32-bits.  If the
+ * ASSERTs here fire, then the call to nlm_init_flock in
+ * nlm_do_lock has failed to restrict a 32-bit client to
+ * 32-bit lock ranges.
+ */
 static void
 nlm_convert_to_nlm_lock(struct nlm_lock *dst, struct nlm4_lock *src)
 {
@@ -55,11 +69,17 @@ nlm_convert_to_nlm_lock(struct nlm_lock *dst, struct nlm4_lock *src)
 	dst->fh = src->fh;
 	dst->oh = src->oh;
 	dst->svid = src->svid;
-	dst->l_offset = src->l_offset;
-	dst->l_len = src->l_len;
+	ASSERT(src->l_offset <= MAX_UOFF32);
+	dst->l_offset = (uint32_t)src->l_offset;
+	ASSERT(src->l_len <= MAX_UOFF32);
+	dst->l_len = (uint32_t)src->l_len;
 }
 
-/* Up-convert for v1 svc functions. */
+/*
+ * Up-convert for v1 svc functions with a 32-bit lock range arg.
+ * Note that lock range checks (like overflow) are done later,
+ * in nlm_init_flock().
+ */
 static void
 nlm_convert_to_nlm4_lock(struct nlm4_lock *dst, struct nlm_lock *src)
 {
@@ -83,15 +103,25 @@ nlm_convert_to_nlm4_share(struct nlm4_share *dst, struct nlm_share *src)
 	dst->access = src->access;
 }
 
+/*
+ * Down-convert for v1 NLM_TEST or NLM_TEST_MSG response.
+ * Note that nlm_do_test is careful to give us lock ranges
+ * that can be represented with 32-bit values.  If the
+ * ASSERTs here fire, then the code in nlm_do_test that
+ * builds an nlm4_holder for a 32-bit client has failed to
+ * restrict the reported conflicting lock range so it's a
+ * valid 32-bit lock range.
+ */
 static void
 nlm_convert_to_nlm_holder(struct nlm_holder *dst, struct nlm4_holder *src)
 {
-
 	dst->exclusive = src->exclusive;
 	dst->svid = src->svid;
 	dst->oh = src->oh;
-	dst->l_offset = src->l_offset;
-	dst->l_len = src->l_len;
+	ASSERT(src->l_offset <= MAX_UOFF32);
+	dst->l_offset = (uint32_t)src->l_offset;
+	ASSERT(src->l_len <= MAX_UOFF32);
+	dst->l_len = (uint32_t)src->l_len;
 }
 
 static enum nlm_stats
@@ -185,7 +215,7 @@ nlm_lock_1_reply(SVCXPRT *transp, nlm4_res *resp)
 }
 
 static enum clnt_stat
-nlm_granted_1_cb(nlm4_testargs *argp, void *null, CLIENT *clnt)
+nlm_granted_1_cb(nlm4_testargs *argp, void *resp, CLIENT *clnt)
 {
 	nlm_testargs args1;
 	nlm_res res1;
@@ -201,7 +231,7 @@ nlm_granted_1_cb(nlm4_testargs *argp, void *null, CLIENT *clnt)
 
 	/* NB: We have a result our caller will not free. */
 	xdr_free((xdrproc_t)xdr_nlm_res, (void *)&res1);
-	(void) null;
+	(void) resp;
 
 	return (rv);
 }
@@ -686,7 +716,7 @@ nlm4_lock_4_reply(SVCXPRT *transp, nlm4_res *resp)
 }
 
 static enum clnt_stat
-nlm4_granted_4_cb(nlm4_testargs *argp, void *null, CLIENT *clnt)
+nlm4_granted_4_cb(nlm4_testargs *argp, void *resp, CLIENT *clnt)
 {
 	nlm4_res res4;
 	int rv;
@@ -696,7 +726,7 @@ nlm4_granted_4_cb(nlm4_testargs *argp, void *null, CLIENT *clnt)
 
 	/* NB: We have a result our caller will not free. */
 	xdr_free((xdrproc_t)xdr_nlm4_res, (void *)&res4);
-	(void) null;
+	(void) resp;
 
 	return (rv);
 }

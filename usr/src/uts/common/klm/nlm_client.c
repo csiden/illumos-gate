@@ -377,6 +377,25 @@ nlm_frlock_setlk(struct nlm_host *hostp, vnode_t *vp,
 		return (error);
 
 	/*
+	 * NFS v2 clients should not request locks where any part
+	 * of the lock range is beyond 0xffffffff.  The NFS code
+	 * checks that (see nfs_frlock, flk_check_lock_data), but
+	 * as that's outside this module, let's check here too.
+	 * This check ensures that we will be able to convert this
+	 * lock request into 32-bit form without change, and that
+	 * (more importantly) when the granted call back arrives,
+	 * it's unchanged when converted back into 64-bit form.
+	 * If this lock range were to change in any way during
+	 * either of those conversions, the "granted" call back
+	 * from the NLM server would not find our sleeping lock.
+	 */
+	if (vers < NLM4_VERS) {
+		if (flkp->l_start > MAX_UOFF32 ||
+		    flkp->l_start + flkp->l_len > MAX_UOFF32 + 1)
+			return (EINVAL);
+	}
+
+	/*
 	 * Fill in l_sysid for the local locking calls.
 	 * Also, let's not trust the caller's l_pid.
 	 */

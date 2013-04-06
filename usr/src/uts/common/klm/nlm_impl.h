@@ -56,6 +56,12 @@
 #define	SEEK_END	2
 #endif
 
+/*
+ * Maximum offset supported by NLM calls using the older
+ * (32-bit) versions of the protocol.
+ */
+#define	MAX_UOFF32	0xffffffffULL
+
 struct nlm_host;
 struct vnode;
 struct exportinfo;
