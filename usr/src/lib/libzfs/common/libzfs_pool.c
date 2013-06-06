@@ -1080,7 +1080,6 @@ zpool_create(libzfs_handle_t *hdl, const char *pool, nvlist_t *nvroot,
 	nvlist_t *zc_fsprops = NULL;
 	nvlist_t *zc_props = NULL;
 	char msg[1024];
-	char *altroot;
 	int ret = -1;
 
 	(void) snprintf(msg, sizeof (msg), dgettext(TEXT_DOMAIN,

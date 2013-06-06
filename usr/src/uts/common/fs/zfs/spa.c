@@ -5671,8 +5671,8 @@ spa_async_resume(spa_t *spa)
 static boolean_t
 spa_async_tasks_pending(spa_t *spa)
 {
-	u_int non_config_tasks;
-	u_int config_task;
+	uint_t non_config_tasks;
+	uint_t config_task;
 	boolean_t config_task_suspended;
 
 	non_config_tasks = spa->spa_async_tasks & ~SPA_ASYNC_CONFIG_UPDATE;

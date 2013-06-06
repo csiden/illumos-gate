@@ -721,11 +721,13 @@ zpool_do_create(int argc, char **argv)
 			 * Uniquely among properties, they can be specified
 			 * more than once, to avoid conflict with -m.
 			 */
-			if (!strcmp(optarg,
-			    zfs_prop_to_name(ZFS_PROP_MOUNTPOINT)))
+			if (0 == strcmp(optarg,
+			    zfs_prop_to_name(ZFS_PROP_MOUNTPOINT))) {
 				mountpoint = propval;
-			if (add_prop_list(optarg, propval, &fsprops, B_FALSE))
+			} else if (add_prop_list(optarg, propval, &fsprops,
+			    B_FALSE)) {
 				goto errout;
+			}
 			break;
 		case ':':
 			(void) fprintf(stderr, gettext("missing argument for "
@@ -894,6 +896,8 @@ zpool_do_create(int argc, char **argv)
 					goto errout;
 			}
 		}
+
+		ret = 1;
 		if (zpool_create(g_zfs, poolname,
 		    nvroot, props, fsprops) == 0) {
 			zfs_handle_t *pool = zfs_open(g_zfs, poolname,
