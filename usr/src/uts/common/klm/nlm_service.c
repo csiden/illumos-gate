@@ -26,7 +26,7 @@
  */
 
 /*
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright 2013 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
@@ -459,16 +459,17 @@ nlm_do_lock(nlm4_lockargs *argp, nlm4_res *resp, struct svc_req *sr,
 	    struct nlm_host *, host, nlm4_lockargs *, argp);
 
 	/*
-	 * If we may need to do _msg_ call needing an RPC
-	 * callback, get the RPC client handle now,
-	 * so we know if we can bind to the NLM service on
-	 * this client.
+	 * If we will be doing a _msg_ call (needing an RPC callback)
+	 * or if this is a blocking lock request for which we may need
+	 * to do a granted callback, then get the RPC client handle now.
+	 * If we can't get this handle, we need to know that before we
+	 * might create a lock that we can't deliver to the client.
 	 *
-	 * Note: host object carries transport type.
-	 * One client using multiple transports gets
-	 * separate sysids for each of its transports.
+	 * Note: Each host object carries its transport type.
+	 * One client using multiple transports gets separate
+	 * host objects (and sysids) for each of its transports.
 	 */
-	if (res_cb != NULL || grant_cb != NULL) {
+	if (res_cb != NULL || (grant_cb != NULL && argp->block)) {
 		error = nlm_host_get_rpc(host, sr->rq_vers, &rpcp);
 		if (error != 0) {
 			status = nlm4_denied_nolocks;
