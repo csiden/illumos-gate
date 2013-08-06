@@ -11,6 +11,7 @@
 
 /*
  * Copyright 2013 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 /*
@@ -30,25 +31,31 @@
 #include "nlm_impl.h"
 
 /*
+ * Dispatch entry function pointers.
+ */
+typedef bool_t (*nlm_svc_func_t)(void *, void *, struct svc_req *);
+typedef void (*nlm_freeres_func_t)(void *);
+
+/*
  * Entries in the dispatch tables below.
  */
 struct dispatch_entry {
-	/* de_func args: argp, resp, svcreq */
-	bool_t		(*de_func)();
-	xdrproc_t	de_xargs;
-	xdrproc_t	de_xres;
-	uint_t		de_flags;
-	/* Flag bits in de_flags */
-
-#define	NLM_DISP_NOREPLY	1	/* Skip svc_sendreply */
-#define	NLM_DISP_NOREMOTE	2	/* Local calls only */
+	nlm_svc_func_t		de_svc;		/* service routine function */
+	xdrproc_t		de_xargs;	/* XDR args decode function */
+	xdrproc_t		de_xres;	/* XDR res encode function */
+	nlm_freeres_func_t	de_resfree;	/* free res function */
+	int			de_ressz;	/* size of result */
+	uint_t			de_flags;	/* flags */
 };
 
+/* Flag bits in de_flags */
+#define	NLM_DISP_NOREMOTE	1	/* Local calls only */
+
 /*
- * Cast macro for dispatch table function pointers.
- * Intentionally does not declare arg types.
+ * Cast macros for dispatch table function pointers.
  */
-#define	RPCGEN_ACTION(func)	(bool_t (*)())func
+#define	NLM_SVC_FUNC(func)	(nlm_svc_func_t)func
+#define	NLM_FREERES_FUNC(func)	(nlm_freeres_func_t)func
 
 /* ARGSUSED */
 static bool_t
@@ -87,6 +94,7 @@ nlm_dispatch(
 		nlm4_testres	au_testres4;
 		nlm4_unlockargs	au_unlockargs4;
 	} argu;
+	void *args = &argu;
 	union {
 		/* All the ret types */
 		int		ru_int;
@@ -98,14 +106,17 @@ nlm_dispatch(
 		nlm4_testres	ru_testres4;
 
 	} resu;
-	bool_t (*func)(char *, void *, struct svc_req *);
-	bool_t do_reply;
+	void *res = &resu;
+	nlm_svc_func_t func;
+	bool_t do_reply = FALSE;
+	bool_t dupcached = FALSE;
+	struct dupreq *dr;
+	int dupstat;
 
-	if ((func = de->de_func) == NULL) {
+	if ((func = de->de_svc) == NULL) {
 		svcerr_noproc(transp);
 		return;
 	}
-
 
 	if ((de->de_flags & NLM_DISP_NOREMOTE) &&
 	    !nlm_caller_is_local(transp)) {
@@ -125,37 +136,129 @@ nlm_dispatch(
 	 *
 	 * There are more complex cases where some dispatch
 	 * functions need to send their own reply.  We chose
-	 * to indicate those using a flag (NLM_DISP_NOREPLY).
-	 * XXX: In retrospect a NULL de_xres field might have
-	 * worked just as well.  That service function would
-	 * simply need to call xdr_free itself.  (would only
-	 * affect nlm_do_lock and it's callers)
+	 * to indicate those by returning false from the
+	 * service routine.
 	 */
-	bzero((char *)&argu, sizeof (argu));
-	if (!SVC_GETARGS(transp, de->de_xargs, (caddr_t)&argu)) {
+	bzero(&argu, sizeof (argu));
+	if (!SVC_GETARGS(transp, de->de_xargs, args)) {
 		svcerr_decode(transp);
 		return;
 	}
 
-	bzero((char *)&resu, sizeof (resu));
-	do_reply = (*func)((char *)&argu, (void *)&resu, rqstp);
+	/*
+	 * Duplicate request cache.
+	 *
+	 * Since none of the NLM replies are very large we have simplified the
+	 * DRC by not distinguishing between idempotent and non-idempotent
+	 * requests.
+	 */
+	dupstat = SVC_DUP_EXT(transp, rqstp, res, de->de_ressz, &dr,
+	    &dupcached);
 
-	if (do_reply && !(de->de_flags & NLM_DISP_NOREPLY)) {
-		ASSERT(de->de_xres != (xdrproc_t)0);
+	switch (dupstat) {
+	case DUP_ERROR:
+		svcerr_systemerr(transp);
+		break;
+	case DUP_INPROGRESS:
+		break;
+	case DUP_NEW:
+	case DUP_DROP:
+		/*
+		 * When UFS is quiescing it uses lockfs to block vnode
+		 * operations until it has finished quiescing.  Set the
+		 * thread's T_DONTPEND flag to prevent the service routine
+		 * from blocking due to a lockfs lock. (See ufs_check_lockfs)
+		 */
+		curthread->t_flag |= T_DONTPEND;
+
+		bzero(&resu, sizeof (resu));
+		do_reply = (*func)(args, res, rqstp);
+
+		curthread->t_flag &= ~T_DONTPEND;
+		if (curthread->t_flag & T_WOULDBLOCK) {
+			curthread->t_flag &= ~T_WOULDBLOCK;
+			SVC_DUPDONE_EXT(transp, dr, res, NULL,
+			    de->de_ressz, DUP_DROP);
+			do_reply = FALSE;
+			break;
+		}
+		SVC_DUPDONE_EXT(transp, dr, res, de->de_resfree,
+		    de->de_ressz, DUP_DONE);
+		dupcached = TRUE;
+		break;
+	case DUP_DONE:
+		/*
+		 * The service routine may have been responsible for sending
+		 * the reply for the original request but for a re-xmitted
+		 * request we don't invoke the service routine so we must
+		 * re-xmit the reply from the dispatch function.
+		 *
+		 * If de_xres is NULL this is a one-way message so no reply is
+		 * needed.
+		 */
+		if (de->de_xres != NULL_xdrproc_t) {
+			do_reply = TRUE;
+		}
+		break;
+	}
+
+	if (do_reply) {
+		ASSERT(de->de_xres != NULL_xdrproc_t);
 		DTRACE_PROBE3(sendreply, struct svc_req *, rqstp,
 		    SVCXPRT *, transp, struct dispatch_entry *, de);
 
-		if (!svc_sendreply(transp, de->de_xres, (char *)&resu)) {
+		if (!svc_sendreply(transp, de->de_xres, res)) {
 			svcerr_systemerr(transp);
 			NLM_ERR("nlm_dispatch(): svc_sendreply() failed!\n");
 		}
+
+		if (!dupcached) {
+			xdr_free(de->de_xres, res);
+		}
 	}
 
-	if (!SVC_FREEARGS(transp, de->de_xargs, (caddr_t)&argu))
+	if (!SVC_FREEARGS(transp, de->de_xargs, args))
 		NLM_WARN("nlm_dispatch(): unable to free arguments");
+}
 
-	if (de->de_xres != (xdrproc_t)0)
-		xdr_free(de->de_xres, (caddr_t)&resu);
+/*
+ * Result free functions.  The functions are called by the RPC duplicate
+ * request cache code when an entry is being evicted from the cache.
+ */
+static void
+nlm_res_free(nlm_res *resp)
+{
+	xdr_free(xdr_nlm_res, (char *)resp);
+}
+
+static void
+nlm_shareres_free(nlm_shareres *resp)
+{
+	xdr_free(xdr_nlm_shareres, (char *)resp);
+}
+
+static void
+nlm_testres_free(nlm_testres *resp)
+{
+	xdr_free(xdr_nlm_testres, (char *)resp);
+}
+
+static void
+nlm4_res_free(nlm4_res *resp)
+{
+	xdr_free(xdr_nlm4_res, (char *)resp);
+}
+
+static void
+nlm4_shareres_free(nlm4_shareres *resp)
+{
+	xdr_free(xdr_nlm4_shareres, (char *)resp);
+}
+
+static void
+nlm4_testres_free(nlm4_testres *resp)
+{
+	xdr_free(xdr_nlm4_testres, (char *)resp);
 }
 
 /*
@@ -177,39 +280,51 @@ nlm_prog_3_dtable[] = {
 	 */
 
 	{ /* 0: NULLPROC */
-	RPCGEN_ACTION(nlm_null_svc),
+	NLM_SVC_FUNC(nlm_null_svc),
 	(xdrproc_t)xdr_void,
 	(xdrproc_t)xdr_void,
+	NULL,
+	0,
 	0 },
 
 	{ /* 1: NLM_TEST */
-	RPCGEN_ACTION(nlm_test_1_svc),
+	NLM_SVC_FUNC(nlm_test_1_svc),
 	(xdrproc_t)xdr_nlm_testargs,
 	(xdrproc_t)xdr_nlm_testres,
+	NLM_FREERES_FUNC(nlm_testres_free),
+	sizeof (nlm_testres),
 	0 },
 
 	{ /* 2: NLM_LOCK */
-	RPCGEN_ACTION(nlm_lock_1_svc),
+	NLM_SVC_FUNC(nlm_lock_1_svc),
 	(xdrproc_t)xdr_nlm_lockargs,
 	(xdrproc_t)xdr_nlm_res,
-	NLM_DISP_NOREPLY },	/* Does it's own reply. */
+	NLM_FREERES_FUNC(nlm_res_free),
+	sizeof (nlm_res),
+	0 },
 
 	{ /* 3: NLM_CANCEL */
-	RPCGEN_ACTION(nlm_cancel_1_svc),
+	NLM_SVC_FUNC(nlm_cancel_1_svc),
 	(xdrproc_t)xdr_nlm_cancargs,
 	(xdrproc_t)xdr_nlm_res,
+	NLM_FREERES_FUNC(nlm_res_free),
+	sizeof (nlm_res),
 	0 },
 
 	{ /* 4: NLM_UNLOCK */
-	RPCGEN_ACTION(nlm_unlock_1_svc),
+	NLM_SVC_FUNC(nlm_unlock_1_svc),
 	(xdrproc_t)xdr_nlm_unlockargs,
 	(xdrproc_t)xdr_nlm_res,
+	NLM_FREERES_FUNC(nlm_res_free),
+	sizeof (nlm_res),
 	0 },
 
 	{ /* 5: NLM_GRANTED */
-	RPCGEN_ACTION(nlm_granted_1_svc),
+	NLM_SVC_FUNC(nlm_granted_1_svc),
 	(xdrproc_t)xdr_nlm_testargs,
 	(xdrproc_t)xdr_nlm_res,
+	NLM_FREERES_FUNC(nlm_res_free),
+	sizeof (nlm_res),
 	0 },
 
 	/*
@@ -219,81 +334,107 @@ nlm_prog_3_dtable[] = {
 	 */
 
 	{ /* 6: NLM_TEST_MSG */
-	RPCGEN_ACTION(nlm_test_msg_1_svc),
+	NLM_SVC_FUNC(nlm_test_msg_1_svc),
 	(xdrproc_t)xdr_nlm_testargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 7: NLM_LOCK_MSG */
-	RPCGEN_ACTION(nlm_lock_msg_1_svc),
+	NLM_SVC_FUNC(nlm_lock_msg_1_svc),
 	(xdrproc_t)xdr_nlm_lockargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 8: NLM_CANCEL_MSG */
-	RPCGEN_ACTION(nlm_cancel_msg_1_svc),
+	NLM_SVC_FUNC(nlm_cancel_msg_1_svc),
 	(xdrproc_t)xdr_nlm_cancargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 9: NLM_UNLOCK_MSG */
-	RPCGEN_ACTION(nlm_unlock_msg_1_svc),
+	NLM_SVC_FUNC(nlm_unlock_msg_1_svc),
 	(xdrproc_t)xdr_nlm_unlockargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 10: NLM_GRANTED_MSG */
-	RPCGEN_ACTION(nlm_granted_msg_1_svc),
+	NLM_SVC_FUNC(nlm_granted_msg_1_svc),
 	(xdrproc_t)xdr_nlm_testargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 11: NLM_TEST_RES */
-	RPCGEN_ACTION(nlm_test_res_1_svc),
+	NLM_SVC_FUNC(nlm_test_res_1_svc),
 	(xdrproc_t)xdr_nlm_testres,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 12: NLM_LOCK_RES */
-	RPCGEN_ACTION(nlm_lock_res_1_svc),
+	NLM_SVC_FUNC(nlm_lock_res_1_svc),
 	(xdrproc_t)xdr_nlm_res,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 13: NLM_CANCEL_RES */
-	RPCGEN_ACTION(nlm_cancel_res_1_svc),
+	NLM_SVC_FUNC(nlm_cancel_res_1_svc),
 	(xdrproc_t)xdr_nlm_res,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 14: NLM_UNLOCK_RES */
-	RPCGEN_ACTION(nlm_unlock_res_1_svc),
+	NLM_SVC_FUNC(nlm_unlock_res_1_svc),
 	(xdrproc_t)xdr_nlm_res,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 15: NLM_GRANTED_RES */
-	RPCGEN_ACTION(nlm_granted_res_1_svc),
+	NLM_SVC_FUNC(nlm_granted_res_1_svc),
 	(xdrproc_t)xdr_nlm_res,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 16: not used */
-	RPCGEN_ACTION(0),
+	NLM_SVC_FUNC(0),
 	(xdrproc_t)0,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 17: NLM_SM_NOTIFY1 */
-	RPCGEN_ACTION(nlm_sm_notify1_2_svc),
+	NLM_SVC_FUNC(nlm_sm_notify1_2_svc),
 	(xdrproc_t)xdr_nlm_sm_status,
 	(xdrproc_t)xdr_void,
+	NULL,
+	0,
 	NLM_DISP_NOREMOTE },
 
 	{ /* 18: NLM_SM_NOTIFY2 */
-	RPCGEN_ACTION(nlm_sm_notify2_2_svc),
+	NLM_SVC_FUNC(nlm_sm_notify2_2_svc),
 	(xdrproc_t)xdr_nlm_sm_status,
 	(xdrproc_t)xdr_void,
+	NULL,
+	0,
 	NLM_DISP_NOREMOTE },
 
 	/*
@@ -301,33 +442,43 @@ nlm_prog_3_dtable[] = {
 	 */
 
 	{ /* 19: not used */
-	RPCGEN_ACTION(0),
+	NLM_SVC_FUNC(0),
 	(xdrproc_t)0,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 20: NLM_SHARE */
-	RPCGEN_ACTION(nlm_share_3_svc),
+	NLM_SVC_FUNC(nlm_share_3_svc),
 	(xdrproc_t)xdr_nlm_shareargs,
 	(xdrproc_t)xdr_nlm_shareres,
+	NLM_FREERES_FUNC(nlm_shareres_free),
+	sizeof (nlm_shareres),
 	0 },
 
 	{ /* 21: NLM_UNSHARE */
-	RPCGEN_ACTION(nlm_unshare_3_svc),
+	NLM_SVC_FUNC(nlm_unshare_3_svc),
 	(xdrproc_t)xdr_nlm_shareargs,
 	(xdrproc_t)xdr_nlm_shareres,
+	NLM_FREERES_FUNC(nlm_shareres_free),
+	sizeof (nlm_shareres),
 	0 },
 
 	{ /* 22: NLM_NM_LOCK */
-	RPCGEN_ACTION(nlm_nm_lock_3_svc),
+	NLM_SVC_FUNC(nlm_nm_lock_3_svc),
 	(xdrproc_t)xdr_nlm_lockargs,
 	(xdrproc_t)xdr_nlm_res,
-	NLM_DISP_NOREPLY },	/* Does it's own reply. */
+	NLM_FREERES_FUNC(nlm_res_free),
+	sizeof (nlm_res),
+	0 },
 
 	{ /* 23: NLM_FREE_ALL */
-	RPCGEN_ACTION(nlm_free_all_3_svc),
+	NLM_SVC_FUNC(nlm_free_all_3_svc),
 	(xdrproc_t)xdr_nlm_notify,
 	(xdrproc_t)xdr_void,
+	NULL,
+	0,
 	0 },
 };
 static int nlm_prog_3_dtsize =
@@ -378,39 +529,51 @@ static const struct dispatch_entry
 nlm_prog_4_dtable[] = {
 
 	{ /* 0: NULLPROC */
-	RPCGEN_ACTION(nlm_null_svc),
+	NLM_SVC_FUNC(nlm_null_svc),
 	(xdrproc_t)xdr_void,
 	(xdrproc_t)xdr_void,
+	NULL,
+	0,
 	0 },
 
 	{ /* 1: NLM4_TEST */
-	RPCGEN_ACTION(nlm4_test_4_svc),
+	NLM_SVC_FUNC(nlm4_test_4_svc),
 	(xdrproc_t)xdr_nlm4_testargs,
 	(xdrproc_t)xdr_nlm4_testres,
+	NLM_FREERES_FUNC(nlm4_testres_free),
+	sizeof (nlm4_testres),
 	0 },
 
 	{ /* 2: NLM4_LOCK */
-	RPCGEN_ACTION(nlm4_lock_4_svc),
+	NLM_SVC_FUNC(nlm4_lock_4_svc),
 	(xdrproc_t)xdr_nlm4_lockargs,
 	(xdrproc_t)xdr_nlm4_res,
-	NLM_DISP_NOREPLY },	/* Does it's own reply. */
+	NLM_FREERES_FUNC(nlm4_res_free),
+	sizeof (nlm4_res),
+	0 },
 
 	{ /* 3: NLM4_CANCEL */
-	RPCGEN_ACTION(nlm4_cancel_4_svc),
+	NLM_SVC_FUNC(nlm4_cancel_4_svc),
 	(xdrproc_t)xdr_nlm4_cancargs,
 	(xdrproc_t)xdr_nlm4_res,
+	NLM_FREERES_FUNC(nlm4_res_free),
+	sizeof (nlm4_res),
 	0 },
 
 	{ /* 4: NLM4_UNLOCK */
-	RPCGEN_ACTION(nlm4_unlock_4_svc),
+	NLM_SVC_FUNC(nlm4_unlock_4_svc),
 	(xdrproc_t)xdr_nlm4_unlockargs,
 	(xdrproc_t)xdr_nlm4_res,
+	NLM_FREERES_FUNC(nlm4_res_free),
+	sizeof (nlm4_res),
 	0 },
 
 	{ /* 5: NLM4_GRANTED */
-	RPCGEN_ACTION(nlm4_granted_4_svc),
+	NLM_SVC_FUNC(nlm4_granted_4_svc),
 	(xdrproc_t)xdr_nlm4_testargs,
 	(xdrproc_t)xdr_nlm4_res,
+	NLM_FREERES_FUNC(nlm4_res_free),
+	sizeof (nlm4_res),
 	0 },
 
 	/*
@@ -420,111 +583,147 @@ nlm_prog_4_dtable[] = {
 	 */
 
 	{ /* 6: NLM4_TEST_MSG */
-	RPCGEN_ACTION(nlm4_test_msg_4_svc),
+	NLM_SVC_FUNC(nlm4_test_msg_4_svc),
 	(xdrproc_t)xdr_nlm4_testargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 7: NLM4_LOCK_MSG */
-	RPCGEN_ACTION(nlm4_lock_msg_4_svc),
+	NLM_SVC_FUNC(nlm4_lock_msg_4_svc),
 	(xdrproc_t)xdr_nlm4_lockargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 8: NLM4_CANCEL_MSG */
-	RPCGEN_ACTION(nlm4_cancel_msg_4_svc),
+	NLM_SVC_FUNC(nlm4_cancel_msg_4_svc),
 	(xdrproc_t)xdr_nlm4_cancargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 9: NLM4_UNLOCK_MSG */
-	RPCGEN_ACTION(nlm4_unlock_msg_4_svc),
+	NLM_SVC_FUNC(nlm4_unlock_msg_4_svc),
 	(xdrproc_t)xdr_nlm4_unlockargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 10: NLM4_GRANTED_MSG */
-	RPCGEN_ACTION(nlm4_granted_msg_4_svc),
+	NLM_SVC_FUNC(nlm4_granted_msg_4_svc),
 	(xdrproc_t)xdr_nlm4_testargs,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 11: NLM4_TEST_RES */
-	RPCGEN_ACTION(nlm4_test_res_4_svc),
+	NLM_SVC_FUNC(nlm4_test_res_4_svc),
 	(xdrproc_t)xdr_nlm4_testres,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 12: NLM4_LOCK_RES */
-	RPCGEN_ACTION(nlm4_lock_res_4_svc),
+	NLM_SVC_FUNC(nlm4_lock_res_4_svc),
 	(xdrproc_t)xdr_nlm4_res,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 13: NLM4_CANCEL_RES */
-	RPCGEN_ACTION(nlm4_cancel_res_4_svc),
+	NLM_SVC_FUNC(nlm4_cancel_res_4_svc),
 	(xdrproc_t)xdr_nlm4_res,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 14: NLM4_UNLOCK_RES */
-	RPCGEN_ACTION(nlm4_unlock_res_4_svc),
+	NLM_SVC_FUNC(nlm4_unlock_res_4_svc),
 	(xdrproc_t)xdr_nlm4_res,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 15: NLM4_GRANTED_RES */
-	RPCGEN_ACTION(nlm4_granted_res_4_svc),
+	NLM_SVC_FUNC(nlm4_granted_res_4_svc),
 	(xdrproc_t)xdr_nlm4_res,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 16: not used */
-	RPCGEN_ACTION(0),
+	NLM_SVC_FUNC(0),
 	(xdrproc_t)0,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 17: NLM_SM_NOTIFY1 (not in v4) */
-	RPCGEN_ACTION(0),
+	NLM_SVC_FUNC(0),
 	(xdrproc_t)0,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 18: NLM_SM_NOTIFY2 (not in v4) */
-	RPCGEN_ACTION(0),
+	NLM_SVC_FUNC(0),
 	(xdrproc_t)0,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 19: not used */
-	RPCGEN_ACTION(0),
+	NLM_SVC_FUNC(0),
 	(xdrproc_t)0,
 	(xdrproc_t)0,
+	NULL,
+	0,
 	0 },
 
 	{ /* 20: NLM4_SHARE */
-	RPCGEN_ACTION(nlm4_share_4_svc),
+	NLM_SVC_FUNC(nlm4_share_4_svc),
 	(xdrproc_t)xdr_nlm4_shareargs,
 	(xdrproc_t)xdr_nlm4_shareres,
+	NLM_FREERES_FUNC(nlm4_shareres_free),
+	sizeof (nlm4_shareres),
 	0 },
 
 	{ /* 21: NLM4_UNSHARE */
-	RPCGEN_ACTION(nlm4_unshare_4_svc),
+	NLM_SVC_FUNC(nlm4_unshare_4_svc),
 	(xdrproc_t)xdr_nlm4_shareargs,
 	(xdrproc_t)xdr_nlm4_shareres,
+	NLM_FREERES_FUNC(nlm4_shareres_free),
+	sizeof (nlm4_shareres),
 	0 },
 
 	{ /* 22: NLM4_NM_LOCK */
-	RPCGEN_ACTION(nlm4_nm_lock_4_svc),
+	NLM_SVC_FUNC(nlm4_nm_lock_4_svc),
 	(xdrproc_t)xdr_nlm4_lockargs,
 	(xdrproc_t)xdr_nlm4_res,
-	NLM_DISP_NOREPLY },	/* Does it's own reply. */
+	NLM_FREERES_FUNC(nlm4_res_free),
+	sizeof (nlm4_res),
+	0 },
 
 	{ /* 23: NLM4_FREE_ALL */
-	RPCGEN_ACTION(nlm4_free_all_4_svc),
+	NLM_SVC_FUNC(nlm4_free_all_4_svc),
 	(xdrproc_t)xdr_nlm4_notify,
 	(xdrproc_t)xdr_void,
+	NULL,
+	0,
 	0 },
 };
 static int nlm_prog_4_dtsize =
